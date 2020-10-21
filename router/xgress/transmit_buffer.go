@@ -19,11 +19,13 @@ package xgress
 import (
 	"github.com/emirpasic/gods/trees/btree"
 	"github.com/emirpasic/gods/utils"
+	"sync/atomic"
 )
 
 type TransmitBuffer struct {
 	tree     *btree.Tree
 	sequence int32
+	size     int64
 }
 
 func NewTransmitBuffer() *TransmitBuffer {
@@ -33,8 +35,13 @@ func NewTransmitBuffer() *TransmitBuffer {
 	}
 }
 
+func (buffer *TransmitBuffer) Size() int64 {
+	return atomic.LoadInt64(&buffer.size)
+}
+
 func (buffer *TransmitBuffer) ReceiveUnordered(payload *Payload) {
 	if payload.GetSequence() > buffer.sequence {
+		atomic.AddInt64(&buffer.size, int64(len(payload.Data)))
 		buffer.tree.Put(payload.GetSequence(), payload)
 	}
 }
@@ -46,6 +53,7 @@ func (buffer *TransmitBuffer) ReadyForTransmit() []*Payload {
 		nextSequence := buffer.tree.LeftKey().(int32)
 		for nextSequence == buffer.sequence+1 {
 			payload := buffer.tree.LeftValue().(*Payload)
+
 			buffer.tree.Remove(nextSequence)
 			buffer.sequence = nextSequence
 

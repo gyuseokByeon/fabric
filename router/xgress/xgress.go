@@ -21,6 +21,7 @@ import (
 	"github.com/michaelquigley/pfxlog"
 	"github.com/openziti/fabric/controller/xt"
 	"github.com/openziti/foundation/identity/identity"
+	"github.com/openziti/foundation/metrics"
 	"github.com/openziti/foundation/util/concurrenz"
 	"github.com/openziti/foundation/util/info"
 	"github.com/openziti/foundation/util/mathz"
@@ -28,6 +29,7 @@ import (
 	"io"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,7 +59,7 @@ type OptionsData map[interface{}]interface{}
 // The BindHandlers are invoked to install the appropriate handlers.
 //
 type BindHandler interface {
-	HandleXgressBind(sessionId *identity.TokenId, address Address, originator Originator, x *Xgress)
+	HandleXgressBind(x *Xgress)
 }
 
 // ReceiveHandler is invoked by an xgress whenever data is received from the connected peer. Generally a ReceiveHandler
@@ -91,6 +93,21 @@ type Connection interface {
 	WritePayload([]byte, map[uint8][]byte) (int, error)
 }
 
+var droppedPayloadsMeter metrics.Meter
+var retransmissions metrics.Meter
+var retransmissionFailures metrics.Meter
+
+var acks metrics.Meter
+var ackFailures metrics.Meter
+
+func InitMetrics(registry metrics.UsageRegistry) {
+	droppedPayloadsMeter = registry.Meter("xgress.dropped_payloads")
+	retransmissions = registry.Meter("xgress.retransmissions")
+	retransmissionFailures = registry.Meter("xgress.retransmission_failures")
+	acks = registry.Meter("xgress.acks")
+	ackFailures = registry.Meter("xgress.ack_failures")
+}
+
 type Xgress struct {
 	sessionId      *identity.TokenId
 	address        Address
@@ -98,7 +115,6 @@ type Xgress struct {
 	originator     Originator
 	Options        *Options
 	txQueue        chan *Payload
-	txBuffer       *TransmitBuffer
 	rxSequence     int32
 	rxSequenceLock sync.Mutex
 	receiveHandler ReceiveHandler
@@ -115,8 +131,7 @@ func NewXgress(sessionId *identity.TokenId, address Address, peer Connection, or
 		peer:       peer,
 		originator: originator,
 		Options:    options,
-		txQueue:    make(chan *Payload),
-		txBuffer:   NewTransmitBuffer(),
+		txQueue:    make(chan *Payload, options.TxQueueSize),
 		rxSequence: 0,
 	}
 }
@@ -208,9 +223,7 @@ func (self *Xgress) Close() {
 		log.Debug("closing tx queue")
 		close(self.txQueue)
 
-		if self.Options.Retransmission && self.payloadBuffer != nil {
-			self.payloadBuffer.Close()
-		}
+		self.payloadBuffer.Close()
 
 		for _, peekHandler := range self.peekHandlers {
 			peekHandler.Close(self)
@@ -245,17 +258,18 @@ func (self *Xgress) SendPayload(payload *Payload) error {
 
 	if !self.closed.Get() {
 		pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields()).Debug("queuing to txQueue")
-		self.txQueue <- payload
+		select {
+		case self.txQueue <- payload:
+		default:
+			droppedPayloadsMeter.Mark(1)
+			pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields()).Debug("dropped from txqueue")
+		}
 	}
 	return nil
 }
 
 func (self *Xgress) SendAcknowledgement(acknowledgement *Acknowledgement) error {
-	if self.Options.Retransmission && self.payloadBuffer != nil {
-		// if we have xgress <-> xgress in a single router, they will share a Payload buffer, as they share
-		// a session and can get caught in deadlock if we don't dispatch to a new goroutine here
-		go self.payloadBuffer.ReceiveAcknowledgement(acknowledgement)
-	}
+	self.payloadBuffer.ReceiveAcknowledgement(acknowledgement)
 	return nil
 }
 
@@ -278,16 +292,12 @@ func (self *Xgress) tx() {
 			payloadLogger := log.WithFields(inPayload.GetLoggerFields())
 			if !self.Options.RandomDrops || rand.Int31n(self.Options.Drop1InN) != 1 {
 				payloadLogger.Debug("adding to transmit buffer")
-				self.txBuffer.ReceiveUnordered(inPayload)
-				if self.Options.Retransmission && self.payloadBuffer != nil {
-					payloadLogger.Debug("acknowledging")
-					self.payloadBuffer.AcknowledgePayload(inPayload)
-				}
+				self.payloadBuffer.PayloadReceived(inPayload)
 			} else {
 				payloadLogger.Error("drop!")
 			}
 
-			ready := self.txBuffer.ReadyForTransmit()
+			ready := self.payloadBuffer.transmitBuffer.ReadyForTransmit()
 			for _, outPayload := range ready {
 				outPayloadLogger := log.WithFields(outPayload.GetLoggerFields())
 				for _, peekHandler := range self.peekHandlers {
@@ -301,6 +311,7 @@ func (self *Xgress) tx() {
 						outPayloadLogger.Debugf("sent (#%d) [%s]", outPayload.GetSequence(), info.ByteCount(int64(n)))
 					}
 				}
+				atomic.AddInt64(&self.payloadBuffer.transmitBuffer.size, -int64(len(outPayload.Data)))
 			}
 
 			if len(ready) < 1 {
@@ -377,8 +388,11 @@ func (self *Xgress) rx() {
 }
 
 func (self *Xgress) forwardPayload(payload *Payload) {
-	if self.Options.Retransmission && self.payloadBuffer != nil {
-		self.payloadBuffer.BufferPayload(payload)
+	sendCallback, err := self.payloadBuffer.BufferPayload(payload)
+
+	if err != nil {
+		pfxlog.Logger().WithError(err).Error("failure forwarding payload")
+		return
 	}
 
 	for _, peekHandler := range self.peekHandlers {
@@ -386,6 +400,7 @@ func (self *Xgress) forwardPayload(payload *Payload) {
 	}
 
 	self.receiveHandler.HandleXgressReceive(payload, self)
+	sendCallback()
 }
 
 func (self *Xgress) nextReceiveSequence() int32 {

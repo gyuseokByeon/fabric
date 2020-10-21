@@ -32,6 +32,7 @@ const (
 	HeaderKeySessionId = 2256
 	HeaderKeySequence  = 2257
 	HeaderKeyFlags     = 2258
+	HeaderKeyFreeSpace = 2259
 
 	ContentTypePayloadType         = 1100
 	ContentTypeAcknowledgementType = 1101
@@ -67,6 +68,7 @@ const (
 type Header struct {
 	SessionId string
 	Flags     uint32
+	FreeSpace uint32
 }
 
 func (header *Header) GetSessionId() string {
@@ -95,6 +97,9 @@ func (header *Header) unmarshallHeader(msg *channel2.Message) error {
 
 	header.SessionId = string(sessionId)
 	header.Flags = flags
+	if header.FreeSpace, ok = msg.GetUint32Header(HeaderKeyFreeSpace); !ok {
+		header.FreeSpace = math.MaxUint32
+	}
 
 	return nil
 }
@@ -104,6 +109,7 @@ func (header *Header) marshallHeader(msg *channel2.Message) {
 	if header.Flags != 0 {
 		msg.PutUint32Header(HeaderKeyFlags, header.Flags)
 	}
+	msg.PutUint32Header(HeaderKeyFreeSpace, header.FreeSpace)
 }
 
 func NewAcknowledgement(sessionId string, originator Originator) *Acknowledgement {

@@ -64,8 +64,8 @@ func NewForwarder(metricsRegistry metrics.UsageRegistry, options *Options) *Forw
 	return forwarder
 }
 
-func (forwarder *Forwarder) PayloadBuffer(sessionId *identity.TokenId, address xgress.Address) *xgress.PayloadBuffer {
-	return forwarder.payloadBufferController.BufferForSession(sessionId, address)
+func (forwarder *Forwarder) PayloadBuffer(x *xgress.Xgress) *xgress.PayloadBuffer {
+	return xgress.NewPayloadBuffer(x, forwarder.payloadBufferController)
 }
 
 func (forwarder *Forwarder) PayloadBufferController() *xgress.PayloadBufferController {
@@ -90,7 +90,7 @@ func (forwarder *Forwarder) UnregisterDestinations(sessionId *identity.TokenId) 
 		for _, address := range addresses {
 			if destination, found := forwarder.destinations.getDestination(address); found {
 				forwarder.destinations.removeDestination(address)
-				destination.(XgressDestination).Close()
+				go destination.(XgressDestination).Close() // create close queue?
 			}
 		}
 		forwarder.destinations.unlinkSession(sessionId)
@@ -135,7 +135,6 @@ func (forwarder *Forwarder) Unroute(sessionId *identity.TokenId, now bool) {
 
 func (forwarder *Forwarder) EndSession(sessionId *identity.TokenId) {
 	forwarder.UnregisterDestinations(sessionId)
-	forwarder.payloadBufferController.EndSession(sessionId)
 }
 
 func (forwarder *Forwarder) ForwardPayload(srcAddr xgress.Address, payload *xgress.Payload) error {

@@ -79,6 +79,7 @@ func Create(config *Config, versionProvider common.VersionProvider) *Router {
 		EventSink:      metrics.NewDispatchWrapper(eventDispatcher.Dispatch),
 	}
 	metricsRegistry := metrics.NewUsageRegistryFromConfig(metricsConfig)
+	xgress.InitMetrics(metricsRegistry)
 
 	return &Router{
 		config:          config,
