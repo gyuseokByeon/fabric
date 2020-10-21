@@ -99,6 +99,7 @@ var retransmissionFailures metrics.Meter
 
 var acks metrics.Meter
 var ackFailures metrics.Meter
+var rttHistogram metrics.Histogram
 
 func InitMetrics(registry metrics.UsageRegistry) {
 	droppedPayloadsMeter = registry.Meter("xgress.dropped_payloads")
@@ -106,6 +107,7 @@ func InitMetrics(registry metrics.UsageRegistry) {
 	retransmissionFailures = registry.Meter("xgress.retransmission_failures")
 	acks = registry.Meter("xgress.acks")
 	ackFailures = registry.Meter("xgress.ack_failures")
+	rttHistogram = registry.Histogram("xgress.rtt")
 }
 
 type Xgress struct {

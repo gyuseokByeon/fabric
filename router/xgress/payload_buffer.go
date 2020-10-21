@@ -109,7 +109,7 @@ func (controller *PayloadBufferController) ackIngester() {
 	var next *ackEntry
 	for {
 		if next == nil {
-			if val, ok := controller.acks.PopFront(); ok {
+			if val, _ := controller.acks.PopFront(); val != nil {
 				next = val.(*ackEntry)
 			}
 		}
@@ -146,7 +146,7 @@ func (controller *PayloadBufferController) retransmitSender() {
 	logger := pfxlog.Logger()
 	for retransmit := range controller.retransmitSend {
 		if err := controller.forwarder.ForwardPayload(retransmit.Address, retransmit.payloadAge.payload); err != nil {
-			logger.WithError(err).Error("unexpected error while retransmitting payload from %v", retransmit.Address)
+			logger.WithError(err).Errorf("unexpected error while retransmitting payload from %v", retransmit.Address)
 			retransmissionFailures.Mark(1)
 		} else {
 			retransmissions.Mark(1)
@@ -167,9 +167,10 @@ type PayloadBuffer struct {
 	controller        *PayloadBufferController
 	transmitBuffer    TransmitBuffer
 	freeSpace         uint32
+	mostRecentRTT     uint16
 
 	config struct {
-		retransmitAge int64
+		retransmitAge uint16
 		ackPeriod     int64
 		ackCount      int
 		idleAckAfter  int64
@@ -204,11 +205,11 @@ func NewPayloadBuffer(x *Xgress, controller *PayloadBufferController) *PayloadBu
 			tree:     btree.NewWith(10240, utils.Int32Comparator),
 			sequence: -1,
 		},
-		freeSpace: math.MaxUint32,
+		freeSpace: 64 * 1024,
 	}
 
 	buffer.config.retransmitAge = 2000
-	buffer.config.ackPeriod = 1000
+	buffer.config.ackPeriod = 64
 	buffer.config.ackCount = 96
 	buffer.config.idleAckAfter = 5000
 
@@ -306,6 +307,8 @@ func (buffer *PayloadBuffer) run() {
 			if payload != nil {
 				if err := buffer.acknowledgePayload(payload); err != nil {
 					log.Errorf("unexpected error (%s)", err)
+				} else if payload.RTT != 0 {
+					buffer.mostRecentRTT = uint16(info.NowInMilliseconds()) - payload.RTT
 				}
 				if err := buffer.acknowledge(); err != nil {
 					log.Errorf("unexpected error (%s)", err)
@@ -339,7 +342,6 @@ func (buffer *PayloadBuffer) run() {
 func (buffer *PayloadBuffer) acknowledgePayload(payload *Payload) error {
 	if buffer.x.sessionId.Token == payload.SessionId {
 		buffer.acked[payload.Sequence] = info.NowInMilliseconds()
-
 	} else {
 		return errors.New("unexpected Payload")
 	}
@@ -358,6 +360,10 @@ func (buffer *PayloadBuffer) receiveAcknowledgement(ack *Acknowledgement) error 
 			log.Debugf("acknowledged sequence [%d]", sequence)
 		}
 		buffer.freeSpace = ack.FreeSpace
+		if ack.RTT > 0 {
+			buffer.config.retransmitAge = ack.RTT
+			rttHistogram.Update(int64(ack.RTT))
+		}
 	} else {
 		return errors.New("unexpected acknowledgement")
 	}
@@ -380,6 +386,10 @@ func (buffer *PayloadBuffer) acknowledge() error {
 		for sequence := range buffer.acked {
 			ack.Sequence = append(ack.Sequence, sequence)
 		}
+		if buffer.mostRecentRTT != 0 {
+			ack.RTT = buffer.mostRecentRTT
+			buffer.mostRecentRTT = 0
+		}
 		log.Debugf("acknowledging [%d] payloads, [%d] buffered", len(ack.Sequence), len(buffer.buffer))
 
 		buffer.controller.ack(ack, buffer.x.address)
@@ -401,7 +411,7 @@ func (buffer *PayloadBuffer) retransmit() error {
 		now := info.NowInMilliseconds()
 		retransmitted := 0
 		for _, v := range buffer.buffer {
-			if v.payload.GetSequence() < buffer.receivedAckHwm && now-v.getAge() > buffer.config.retransmitAge {
+			if v.payload.GetSequence() < buffer.receivedAckHwm && uint16(now-v.getAge()) > buffer.config.retransmitAge {
 				buffer.controller.retransmit(v, buffer.x.address)
 				retransmitted++
 			}

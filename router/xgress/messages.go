@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"github.com/openziti/foundation/channel2"
+	"github.com/openziti/foundation/util/info"
 	"github.com/openziti/foundation/util/uuidz"
 	"github.com/sirupsen/logrus"
 	"math"
@@ -33,6 +34,7 @@ const (
 	HeaderKeySequence  = 2257
 	HeaderKeyFlags     = 2258
 	HeaderKeyFreeSpace = 2259
+	HeaderKeyRTT       = 2260
 
 	ContentTypePayloadType         = 1100
 	ContentTypeAcknowledgementType = 1101
@@ -69,6 +71,7 @@ type Header struct {
 	SessionId string
 	Flags     uint32
 	FreeSpace uint32
+	RTT       uint16
 }
 
 func (header *Header) GetSessionId() string {
@@ -101,6 +104,8 @@ func (header *Header) unmarshallHeader(msg *channel2.Message) error {
 		header.FreeSpace = math.MaxUint32
 	}
 
+	header.RTT, _ = msg.GetUint16Header(HeaderKeyRTT)
+
 	return nil
 }
 
@@ -110,6 +115,7 @@ func (header *Header) marshallHeader(msg *channel2.Message) {
 		msg.PutUint32Header(HeaderKeyFlags, header.Flags)
 	}
 	msg.PutUint32Header(HeaderKeyFreeSpace, header.FreeSpace)
+	msg.PutUint16Header(HeaderKeyRTT, header.RTT)
 }
 
 func NewAcknowledgement(sessionId string, originator Originator) *Acknowledgement {
@@ -154,7 +160,7 @@ func (ack *Acknowledgement) unmarshallSequence(data []byte) error {
 	ack.Sequence = make([]int32, len(data)/4)
 
 	nextReadBuf := data
-	for i, _ := range ack.Sequence {
+	for i := range ack.Sequence {
 		ack.Sequence[i] = int32(binary.BigEndian.Uint32(nextReadBuf))
 		nextReadBuf = nextReadBuf[4:]
 	}
@@ -192,6 +198,7 @@ func (payload *Payload) GetSequence() int32 {
 }
 
 func (payload *Payload) Marshall() *channel2.Message {
+	payload.RTT = uint16(info.NowInMilliseconds())
 	msg := channel2.NewMessage(ContentTypePayloadType, payload.Data)
 	for key, value := range payload.Headers {
 		msgHeaderKey := MinHeaderKey + int32(key)
@@ -199,6 +206,7 @@ func (payload *Payload) Marshall() *channel2.Message {
 	}
 	payload.marshallHeader(msg)
 	msg.PutUint64Header(HeaderKeySequence, uint64(payload.Sequence))
+
 	return msg
 }
 
