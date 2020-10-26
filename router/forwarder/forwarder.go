@@ -17,7 +17,6 @@
 package forwarder
 
 import (
-	"errors"
 	"github.com/michaelquigley/pfxlog"
 	"github.com/openziti/fabric/pb/ctrl_pb"
 	"github.com/openziti/fabric/router/xgress"
@@ -25,6 +24,7 @@ import (
 	"github.com/openziti/fabric/trace"
 	"github.com/openziti/foundation/metrics"
 	"github.com/openziti/foundation/util/info"
+	"github.com/pkg/errors"
 	"time"
 )
 
@@ -150,13 +150,13 @@ func (forwarder *Forwarder) ForwardPayload(srcAddr xgress.Address, payload *xgre
 				forwardTable.lastUsed = info.NowInMilliseconds()
 				return nil
 			} else {
-				return errors.New("no destination")
+				return errors.Errorf("cannot forward payload, no destination for session=%v src=%v dst=%v", sessionId, srcAddr, dstAddr)
 			}
 		} else {
-			return errors.New("no destination address")
+			return errors.Errorf("cannot forward payload, no destination address for session=%v src=%v", sessionId, srcAddr)
 		}
 	} else {
-		return errors.New("cannot forward payload, no forward table")
+		return errors.Errorf("cannot forward payload, no forward table for session=%v src=%v", sessionId, srcAddr)
 	}
 }
 
@@ -175,15 +175,15 @@ func (forwarder *Forwarder) ForwardAcknowledgement(srcAddr xgress.Address, ackno
 				return nil
 
 			} else {
-				return errors.New("no destination")
+				return errors.Errorf("cannot acknowledge, no destination for session=%v src=%v dst=%v", sessionId, srcAddr, dstAddr)
 			}
 
 		} else {
-			return errors.New("no destination address")
+			return errors.Errorf("cannot acknowledge, no destination address for session=%v src=%v", sessionId, srcAddr)
 		}
 
 	} else {
-		return errors.New("cannot acknowledge, no forward table")
+		return errors.Errorf("cannot acknowledge, no forward table for session=%v src=%v", sessionId, srcAddr)
 	}
 }
 

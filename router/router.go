@@ -251,7 +251,7 @@ func (self *Router) startXgressListeners() {
 		if address, found := binding.options["address"]; found {
 			err = listener.Listen(address.(string),
 				handler_xgress.NewBindHandler(
-					handler_xgress.NewReceiveHandler(self, self.forwarder),
+					handler_xgress.NewReceiveHandler(self.forwarder),
 					handler_xgress.NewCloseHandler(self, self.forwarder),
 					self.forwarder,
 				),
