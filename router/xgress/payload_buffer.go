@@ -220,12 +220,12 @@ func NewPayloadBuffer(x *Xgress, controller *PayloadBufferController) *PayloadBu
 func (buffer *PayloadBuffer) BufferPayload(payload *Payload) (func(), error) {
 	defer func() {
 		if r := recover(); r != nil {
-			pfxlog.ContextLogger("s/" + buffer.x.sessionId.Token).Error("send on closed channel")
+			pfxlog.ContextLogger("s/" + buffer.x.sessionId).Error("send on closed channel")
 		}
 	}()
 
-	if buffer.x.sessionId.Token != payload.GetSessionId() {
-		return nil, errors.Errorf("bad payload. should have session %v, but had %v", buffer.x.sessionId.Id, payload.GetSessionId())
+	if buffer.x.sessionId != payload.GetSessionId() {
+		return nil, errors.Errorf("bad payload. should have session %v, but had %v", buffer.x.sessionId, payload.GetSessionId())
 	}
 
 	payloadAge := &payloadAge{payload: payload, age: math.MaxInt64}
@@ -237,7 +237,7 @@ func (buffer *PayloadBuffer) BufferPayload(payload *Payload) (func(), error) {
 func (buffer *PayloadBuffer) PayloadReceived(payload *Payload) {
 	defer func() {
 		if r := recover(); r != nil {
-			pfxlog.ContextLogger("s/" + buffer.x.sessionId.Token).Error("send on closed channel")
+			pfxlog.ContextLogger("s/" + buffer.x.sessionId).Error("send on closed channel")
 		}
 	}()
 	pfxlog.Logger().WithFields(payload.GetLoggerFields()).Debug("acknowledging")
@@ -249,7 +249,7 @@ func (buffer *PayloadBuffer) PayloadReceived(payload *Payload) {
 func (buffer *PayloadBuffer) ReceiveAcknowledgement(ack *Acknowledgement) {
 	defer func() {
 		if r := recover(); r != nil {
-			pfxlog.ContextLogger("s/" + buffer.x.sessionId.Token).Error("send on closed channel")
+			pfxlog.ContextLogger("s/" + buffer.x.sessionId).Error("send on closed channel")
 		}
 	}()
 	buffer.newlyReceivedAcks <- ack
@@ -269,7 +269,7 @@ func (buffer *PayloadBuffer) Close() {
 }
 
 func (buffer *PayloadBuffer) run() {
-	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId.Token)
+	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId)
 	defer log.Debugf("[%p] exited", buffer)
 	log.Debugf("[%p] started", buffer)
 
@@ -340,7 +340,7 @@ func (buffer *PayloadBuffer) run() {
 }
 
 func (buffer *PayloadBuffer) acknowledgePayload(payload *Payload) error {
-	if buffer.x.sessionId.Token == payload.SessionId {
+	if buffer.x.sessionId == payload.SessionId {
 		buffer.acked[payload.Sequence] = info.NowInMilliseconds()
 	} else {
 		return errors.New("unexpected Payload")
@@ -350,8 +350,8 @@ func (buffer *PayloadBuffer) acknowledgePayload(payload *Payload) error {
 }
 
 func (buffer *PayloadBuffer) receiveAcknowledgement(ack *Acknowledgement) error {
-	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId.Token)
-	if buffer.x.sessionId.Token == ack.SessionId {
+	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId)
+	if buffer.x.sessionId == ack.SessionId {
 		for _, sequence := range ack.Sequence {
 			if sequence > buffer.receivedAckHwm {
 				buffer.receivedAckHwm = sequence
@@ -371,13 +371,13 @@ func (buffer *PayloadBuffer) receiveAcknowledgement(ack *Acknowledgement) error 
 }
 
 func (buffer *PayloadBuffer) acknowledge() error {
-	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId.Token)
+	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId)
 	now := info.NowInMilliseconds()
 
 	if now-buffer.lastAck >= buffer.config.ackPeriod || len(buffer.acked) >= buffer.config.ackCount {
 		log.Debug("ready to acknowledge")
 
-		ack := NewAcknowledgement(buffer.x.sessionId.Token, buffer.x.originator)
+		ack := NewAcknowledgement(buffer.x.sessionId, buffer.x.originator)
 		freeSpace := 4*64*1024 - buffer.transmitBuffer.Size()
 		if freeSpace < 0 {
 			freeSpace = 0
@@ -406,7 +406,7 @@ func (buffer *PayloadBuffer) acknowledge() error {
 
 func (buffer *PayloadBuffer) retransmit() error {
 	if len(buffer.buffer) > 0 {
-		log := pfxlog.ContextLogger(fmt.Sprintf("s/" + buffer.x.sessionId.Token))
+		log := pfxlog.ContextLogger(fmt.Sprintf("s/" + buffer.x.sessionId))
 
 		now := info.NowInMilliseconds()
 		retransmitted := 0
@@ -425,7 +425,7 @@ func (buffer *PayloadBuffer) retransmit() error {
 }
 
 func (buffer *PayloadBuffer) debug(now int64) {
-	pfxlog.ContextLogger(buffer.x.sessionId.Token).Debugf("buffer=[%d], acked=[%d], lastAck=[%d ms.], receivedAckHwm=[%d]",
+	pfxlog.ContextLogger(buffer.x.sessionId).Debugf("buffer=[%d], acked=[%d], lastAck=[%d ms.], receivedAckHwm=[%d]",
 		len(buffer.buffer), len(buffer.acked), now-buffer.lastAck, buffer.receivedAckHwm)
 }
 

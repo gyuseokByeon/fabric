@@ -23,7 +23,6 @@ import (
 	"github.com/openziti/fabric/router/xgress"
 	"github.com/openziti/fabric/router/xlink"
 	"github.com/openziti/fabric/trace"
-	"github.com/openziti/foundation/identity/identity"
 	"github.com/openziti/foundation/metrics"
 	"github.com/openziti/foundation/util/info"
 	"time"
@@ -80,12 +79,12 @@ func (forwarder *Forwarder) TraceController() trace.Controller {
 	return forwarder.traceController
 }
 
-func (forwarder *Forwarder) RegisterDestination(sessionId *identity.TokenId, address xgress.Address, destination Destination) {
+func (forwarder *Forwarder) RegisterDestination(sessionId string, address xgress.Address, destination Destination) {
 	forwarder.destinations.addDestination(address, destination)
 	forwarder.destinations.linkDestinationToSession(sessionId, address)
 }
 
-func (forwarder *Forwarder) UnregisterDestinations(sessionId *identity.TokenId) {
+func (forwarder *Forwarder) UnregisterDestinations(sessionId string) {
 	if addresses, found := forwarder.destinations.getAddressesForSession(sessionId); found {
 		for _, address := range addresses {
 			if destination, found := forwarder.destinations.getDestination(address); found {
@@ -111,7 +110,7 @@ func (forwarder *Forwarder) UnregisterLink(link xlink.Xlink) {
 }
 
 func (forwarder *Forwarder) Route(route *ctrl_pb.Route) {
-	sessionId := &identity.TokenId{Token: route.SessionId}
+	sessionId := route.SessionId
 	var sessionFt *forwardTable
 	if ft, found := forwarder.sessions.getForwardTable(sessionId); found {
 		sessionFt = ft
@@ -124,7 +123,7 @@ func (forwarder *Forwarder) Route(route *ctrl_pb.Route) {
 	forwarder.sessions.setForwardTable(sessionId, sessionFt)
 }
 
-func (forwarder *Forwarder) Unroute(sessionId *identity.TokenId, now bool) {
+func (forwarder *Forwarder) Unroute(sessionId string, now bool) {
 	if now {
 		forwarder.sessions.removeForwardTable(sessionId)
 		forwarder.EndSession(sessionId)
@@ -133,14 +132,14 @@ func (forwarder *Forwarder) Unroute(sessionId *identity.TokenId, now bool) {
 	}
 }
 
-func (forwarder *Forwarder) EndSession(sessionId *identity.TokenId) {
+func (forwarder *Forwarder) EndSession(sessionId string) {
 	forwarder.UnregisterDestinations(sessionId)
 }
 
 func (forwarder *Forwarder) ForwardPayload(srcAddr xgress.Address, payload *xgress.Payload) error {
 	log := pfxlog.ContextLogger(string(srcAddr))
 
-	sessionId := &identity.TokenId{Token: payload.GetSessionId()}
+	sessionId := payload.GetSessionId()
 	if forwardTable, found := forwarder.sessions.getForwardTable(sessionId); found {
 		if dstAddr, found := forwardTable.getForwardAddress(srcAddr); found {
 			if dst, found := forwarder.destinations.getDestination(dstAddr); found {
@@ -164,7 +163,7 @@ func (forwarder *Forwarder) ForwardPayload(srcAddr xgress.Address, payload *xgre
 func (forwarder *Forwarder) ForwardAcknowledgement(srcAddr xgress.Address, acknowledgement *xgress.Acknowledgement) error {
 	log := pfxlog.ContextLogger(string(srcAddr))
 
-	sessionId := &identity.TokenId{Token: acknowledgement.SessionId}
+	sessionId := acknowledgement.SessionId
 	if forwardTable, found := forwarder.sessions.getForwardTable(sessionId); found {
 		if dstAddr, found := forwardTable.getForwardAddress(srcAddr); found {
 			if dst, found := forwarder.destinations.getDestination(dstAddr); found {
@@ -196,8 +195,8 @@ func (forwarder *Forwarder) Debug() string {
 // for a session, it will be checked repeatedly, looking to see if the session has crossed the inactivity threshold.
 // Once it crosses the inactivity threshold, it gets removed.
 //
-func (forwarder *Forwarder) unrouteTimeout(sessionId *identity.TokenId, ms int64) {
-	log := pfxlog.ContextLogger("s/" + sessionId.Token)
+func (forwarder *Forwarder) unrouteTimeout(sessionId string, ms int64) {
+	log := pfxlog.ContextLogger("s/" + sessionId)
 	log.Debug("scheduled")
 	defer log.Debug("timeout")
 

@@ -22,7 +22,6 @@ import (
 	"github.com/openziti/fabric/router/xgress"
 	"github.com/openziti/fabric/router/xlink"
 	"github.com/openziti/foundation/channel2"
-	"github.com/openziti/foundation/identity/identity"
 )
 
 type payloadHandler struct {
@@ -48,7 +47,7 @@ func (self *payloadHandler) HandleReceive(msg *channel2.Message, ch channel2.Cha
 			log.Debugf("unable to forward (%v)", err)
 		}
 		if payload.IsSessionEndFlagSet() {
-			self.forwarder.EndSession(&identity.TokenId{Token: payload.GetSessionId()})
+			self.forwarder.EndSession(payload.GetSessionId())
 		}
 	} else {
 		log.Errorf("unexpected error (%v)", err)

@@ -111,7 +111,7 @@ func InitMetrics(registry metrics.UsageRegistry) {
 }
 
 type Xgress struct {
-	sessionId      *identity.TokenId
+	sessionId      string
 	address        Address
 	peer           Connection
 	originator     Originator
@@ -128,7 +128,7 @@ type Xgress struct {
 
 func NewXgress(sessionId *identity.TokenId, address Address, peer Connection, originator Originator, options *Options) *Xgress {
 	return &Xgress{
-		sessionId:  sessionId,
+		sessionId:  sessionId.Token,
 		address:    address,
 		peer:       peer,
 		originator: originator,
@@ -138,7 +138,7 @@ func NewXgress(sessionId *identity.TokenId, address Address, peer Connection, or
 	}
 }
 
-func (self *Xgress) SessionId() *identity.TokenId {
+func (self *Xgress) SessionId() string {
 	return self.sessionId
 }
 
@@ -183,13 +183,13 @@ func (self *Xgress) Start() {
 }
 
 func (self *Xgress) Label() string {
-	return fmt.Sprintf("{s/%s|@/%s}<%s>", self.sessionId.Token, string(self.address), self.originator.String())
+	return fmt.Sprintf("{s/%s|@/%s}<%s>", self.sessionId, string(self.address), self.originator.String())
 }
 
 func (self *Xgress) GetStartSession() *Payload {
 	startSession := &Payload{
 		Header: Header{
-			SessionId: self.sessionId.Token,
+			SessionId: self.sessionId,
 			Flags:     SetOriginatorFlag(uint32(PayloadFlagSessionStart), self.originator),
 		},
 		Sequence: self.nextReceiveSequence(),
@@ -201,7 +201,7 @@ func (self *Xgress) GetStartSession() *Payload {
 func (self *Xgress) GetEndSession() *Payload {
 	endSession := &Payload{
 		Header: Header{
-			SessionId: self.sessionId.Token,
+			SessionId: self.sessionId,
 			Flags:     SetOriginatorFlag(uint32(PayloadFlagSessionEnd), self.originator),
 		},
 		Sequence: self.nextReceiveSequence(),
@@ -361,7 +361,7 @@ func (self *Xgress) rx() {
 				length := mathz.MinInt(remaining, int(self.Options.Mtu))
 				payload := &Payload{
 					Header: Header{
-						SessionId: self.sessionId.Token,
+						SessionId: self.sessionId,
 						Flags:     SetOriginatorFlag(0, self.originator),
 					},
 					Sequence: self.nextReceiveSequence(),
