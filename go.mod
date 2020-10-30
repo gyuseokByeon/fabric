@@ -2,7 +2,7 @@ module github.com/openziti/fabric
 
 go 1.15
 
-// replace github.com/openziti/foundation => ../foundation
+replace github.com/openziti/foundation => ../foundation
 
 require (
 	github.com/biogo/store v0.0.0-20190426020002-884f370e325d

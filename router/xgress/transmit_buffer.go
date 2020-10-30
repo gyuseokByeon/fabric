@@ -19,13 +19,14 @@ package xgress
 import (
 	"github.com/emirpasic/gods/trees/btree"
 	"github.com/emirpasic/gods/utils"
+	"github.com/michaelquigley/pfxlog"
 	"sync/atomic"
 )
 
 type TransmitBuffer struct {
 	tree     *btree.Tree
 	sequence int32
-	size     int64
+	size     uint32
 }
 
 func NewTransmitBuffer() *TransmitBuffer {
@@ -35,15 +36,22 @@ func NewTransmitBuffer() *TransmitBuffer {
 	}
 }
 
-func (buffer *TransmitBuffer) Size() int64 {
-	return atomic.LoadInt64(&buffer.size)
+func (buffer *TransmitBuffer) Size() uint32 {
+	return atomic.LoadUint32(&buffer.size)
 }
 
 func (buffer *TransmitBuffer) ReceiveUnordered(payload *Payload) {
 	if payload.GetSequence() > buffer.sequence {
-		atomic.AddInt64(&buffer.size, int64(len(payload.Data)))
+		treeSize := buffer.tree.Size()
 		buffer.tree.Put(payload.GetSequence(), payload)
+		if buffer.tree.Size() > treeSize {
+			payloadSize := len(payload.Data)
+			size := atomic.AddUint32(&buffer.size, uint32(payloadSize))
+			pfxlog.Logger().Infof("Payload %v of size %v added to transmit buffer. New size: %v", payload.Sequence, payloadSize, size)
+			localTxBufferSizeHistogram.Update(int64(size))
+		}
 	}
+
 }
 
 func (buffer *TransmitBuffer) ReadyForTransmit() []*Payload {
@@ -66,4 +74,23 @@ func (buffer *TransmitBuffer) ReadyForTransmit() []*Payload {
 	}
 
 	return ready
+}
+
+func (buffer *TransmitBuffer) NextReadyPayload() *Payload {
+	var payload *Payload
+	if buffer.tree.LeftKey() != nil {
+		nextSequence := buffer.tree.LeftKey().(int32)
+		if nextSequence == buffer.sequence+1 {
+			payload = buffer.tree.LeftValue().(*Payload)
+
+			buffer.tree.Remove(nextSequence)
+			buffer.sequence = nextSequence
+
+			if buffer.tree.Size() > 0 {
+				nextSequence = buffer.tree.LeftKey().(int32)
+			}
+		}
+	}
+
+	return payload
 }

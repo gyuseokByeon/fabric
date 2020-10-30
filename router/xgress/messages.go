@@ -30,11 +30,11 @@ const (
 	MinHeaderKey = 2000
 	MaxHeaderKey = MinHeaderKey + int32(math.MaxUint8)
 
-	HeaderKeySessionId = 2256
-	HeaderKeySequence  = 2257
-	HeaderKeyFlags     = 2258
-	HeaderKeyFreeSpace = 2259
-	HeaderKeyRTT       = 2260
+	HeaderKeySessionId    = 2256
+	HeaderKeySequence     = 2257
+	HeaderKeyFlags        = 2258
+	HeaderKeyTxBufferSize = 2259
+	HeaderKeyRTT          = 2260
 
 	ContentTypePayloadType         = 1100
 	ContentTypeAcknowledgementType = 1101
@@ -68,10 +68,10 @@ const (
 )
 
 type Header struct {
-	SessionId string
-	Flags     uint32
-	FreeSpace uint32
-	RTT       uint16
+	SessionId    string
+	Flags        uint32
+	TxBufferSize uint32
+	RTT          uint16
 }
 
 func (header *Header) GetSessionId() string {
@@ -100,8 +100,8 @@ func (header *Header) unmarshallHeader(msg *channel2.Message) error {
 
 	header.SessionId = string(sessionId)
 	header.Flags = flags
-	if header.FreeSpace, ok = msg.GetUint32Header(HeaderKeyFreeSpace); !ok {
-		header.FreeSpace = math.MaxUint32
+	if header.TxBufferSize, ok = msg.GetUint32Header(HeaderKeyTxBufferSize); !ok {
+		header.TxBufferSize = math.MaxUint32
 	}
 
 	header.RTT, _ = msg.GetUint16Header(HeaderKeyRTT)
@@ -114,7 +114,7 @@ func (header *Header) marshallHeader(msg *channel2.Message) {
 	if header.Flags != 0 {
 		msg.PutUint32Header(HeaderKeyFlags, header.Flags)
 	}
-	msg.PutUint32Header(HeaderKeyFreeSpace, header.FreeSpace)
+	msg.PutUint32Header(HeaderKeyTxBufferSize, header.TxBufferSize)
 	msg.PutUint16Header(HeaderKeyRTT, header.RTT)
 }
 

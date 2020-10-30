@@ -59,7 +59,7 @@ func NewForwarder(metricsRegistry metrics.UsageRegistry, options *Options) *Forw
 		Options:         options,
 	}
 
-	forwarder.payloadBufferController = xgress.NewPayloadBufferController(forwarder)
+	forwarder.payloadBufferController = xgress.NewPayloadBufferController(forwarder, metricsRegistry)
 	return forwarder
 }
 

@@ -23,6 +23,8 @@ import (
 	"github.com/emirpasic/gods/trees/btree"
 	"github.com/emirpasic/gods/utils"
 	"github.com/michaelquigley/pfxlog"
+	"github.com/openziti/foundation/metrics"
+	"github.com/openziti/foundation/util/concurrenz"
 	"github.com/openziti/foundation/util/info"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -39,17 +41,21 @@ type PayloadBufferForwarder interface {
 }
 
 type PayloadBufferController struct {
-	forwarder        PayloadBufferForwarder
-	retransmits      *llrb.Tree
-	retransmitIngest chan *retransmit
-	retransmitSend   chan *retransmit
-	acks             *deque.Deque
-	ackIngest        chan *ackEntry
-	ackSend          chan *ackEntry
-	ackTicker        *time.Ticker
+	forwarder                    PayloadBufferForwarder
+	retransmits                  *llrb.Tree
+	retransmitIngest             chan *retransmit
+	retransmitSend               chan *retransmit
+	acks                         *deque.Deque
+	ackIngest                    chan *ackEntry
+	ackSend                      chan *ackEntry
+	ackTicker                    *time.Ticker
+	acksQueueSize                int64
+	retransmitsQueueSize         int64
+	buffersBlockedByLocalWindow  int64
+	buffersBlockedByRemoteWindow int64
 }
 
-func NewPayloadBufferController(forwarder PayloadBufferForwarder) *PayloadBufferController {
+func NewPayloadBufferController(forwarder PayloadBufferForwarder, metrics metrics.Registry) *PayloadBufferController {
 	ctrl := &PayloadBufferController{
 		forwarder:        forwarder,
 		retransmits:      &llrb.Tree{},
@@ -60,10 +66,28 @@ func NewPayloadBufferController(forwarder PayloadBufferForwarder) *PayloadBuffer
 		ackSend:          make(chan *ackEntry, 1),
 		ackTicker:        time.NewTicker(250 * time.Millisecond),
 	}
+
 	go ctrl.ackIngester()
 	go ctrl.ackSender()
 	go ctrl.retransmitIngester()
 	go ctrl.retransmitSender()
+
+	metrics.FuncGauge("xgress.acks.queue_size", func() int64 {
+		return atomic.LoadInt64(&ctrl.acksQueueSize)
+	})
+
+	metrics.FuncGauge("xgress.retransmits.queue_size", func() int64 {
+		return atomic.LoadInt64(&ctrl.retransmitsQueueSize)
+	})
+
+	metrics.FuncGauge("xgress.blocked_by_local_window", func() int64 {
+		return atomic.LoadInt64(&ctrl.buffersBlockedByLocalWindow)
+	})
+
+	metrics.FuncGauge("xgress.blocked_by_remote_window", func() int64 {
+		return atomic.LoadInt64(&ctrl.buffersBlockedByRemoteWindow)
+	})
+
 	return ctrl
 }
 
@@ -84,7 +108,7 @@ func (controller *PayloadBufferController) ack(ack *Acknowledgement, address Add
 func (controller *PayloadBufferController) retransmitIngester() {
 	var next *retransmit
 	for {
-		if next == nil && controller.retransmits.Count > 1 {
+		if next == nil && controller.retransmits.Count > 0 {
 			next = controller.retransmits.Max().(*retransmit)
 			controller.retransmits.DeleteMax()
 		}
@@ -102,6 +126,7 @@ func (controller *PayloadBufferController) retransmitIngester() {
 				next = nil
 			}
 		}
+		atomic.StoreInt64(&controller.retransmitsQueueSize, int64(controller.retransmits.Count))
 	}
 }
 
@@ -127,6 +152,7 @@ func (controller *PayloadBufferController) ackIngester() {
 				next = nil
 			}
 		}
+		atomic.StoreInt64(&controller.acksQueueSize, int64(controller.acks.Len()))
 	}
 }
 
@@ -137,7 +163,7 @@ func (controller *PayloadBufferController) ackSender() {
 			logger.WithError(err).Errorf("unexpected error while sending ack from %v", nextAck.Address)
 			ackFailures.Mark(1)
 		} else {
-			acks.Mark(1)
+			ackTxMeter.Mark(1)
 		}
 	}
 }
@@ -156,18 +182,25 @@ func (controller *PayloadBufferController) retransmitSender() {
 }
 
 type PayloadBuffer struct {
-	x                 *Xgress
-	buffer            map[int32]*payloadAge
-	newlyBuffered     chan *payloadAge
-	acked             map[int32]int64
-	lastAck           int64
-	newlyAcknowledged chan *Payload
-	newlyReceivedAcks chan *Acknowledgement
-	receivedAckHwm    int32
-	controller        *PayloadBufferController
-	transmitBuffer    TransmitBuffer
-	freeSpace         uint32
-	mostRecentRTT     uint16
+	x                     *Xgress
+	buffer                map[int32]*payloadAge
+	newlyBuffered         chan *payloadAge
+	acked                 map[int32]int64
+	lastAck               int64
+	newlyAcknowledged     chan *Payload
+	newlyReceivedAcks     chan *Acknowledgement
+	receivedAckHwm        int32
+	controller            *PayloadBufferController
+	transmitBuffer        TransmitBuffer
+	windowsSize           uint32
+	rxBufferSize          uint32
+	txBufferSize          uint32
+	mostRecentRTT         uint16
+	closeNotify           chan struct{}
+	closed                concurrenz.AtomicBoolean
+	blockedByLocalWindow  bool
+	blockedByRemoteWindow bool
+	lastBufferSizeSent    uint32
 
 	config struct {
 		retransmitAge uint16
@@ -194,7 +227,7 @@ func NewPayloadBuffer(x *Xgress, controller *PayloadBufferController) *PayloadBu
 	buffer := &PayloadBuffer{
 		x:                 x,
 		buffer:            make(map[int32]*payloadAge),
-		newlyBuffered:     make(chan *payloadAge),
+		newlyBuffered:     make(chan *payloadAge, x.Options.TxQueueSize),
 		acked:             make(map[int32]int64),
 		lastAck:           info.NowInMilliseconds(),
 		newlyAcknowledged: make(chan *Payload),
@@ -205,7 +238,8 @@ func NewPayloadBuffer(x *Xgress, controller *PayloadBufferController) *PayloadBu
 			tree:     btree.NewWith(10240, utils.Int32Comparator),
 			sequence: -1,
 		},
-		freeSpace: 64 * 1024,
+		windowsSize: 256 * 1024,
+		closeNotify: make(chan struct{}),
 	}
 
 	buffer.config.retransmitAge = 2000
@@ -218,54 +252,75 @@ func NewPayloadBuffer(x *Xgress, controller *PayloadBufferController) *PayloadBu
 }
 
 func (buffer *PayloadBuffer) BufferPayload(payload *Payload) (func(), error) {
-	defer func() {
-		if r := recover(); r != nil {
-			pfxlog.ContextLogger("s/" + buffer.x.sessionId).Error("send on closed channel")
-		}
-	}()
-
 	if buffer.x.sessionId != payload.GetSessionId() {
 		return nil, errors.Errorf("bad payload. should have session %v, but had %v", buffer.x.sessionId, payload.GetSessionId())
 	}
 
 	payloadAge := &payloadAge{payload: payload, age: math.MaxInt64}
-	buffer.newlyBuffered <- payloadAge
-	pfxlog.ContextLogger("s/"+payload.GetSessionId()).Debugf("buffered [%d]", payload.GetSequence())
-	return payloadAge.markSent, nil
+	select {
+	case buffer.newlyBuffered <- payloadAge:
+		pfxlog.ContextLogger("s/"+payload.GetSessionId()).Debugf("buffered [%d]", payload.GetSequence())
+		return payloadAge.markSent, nil
+	case <-buffer.closeNotify:
+		return nil, errors.Errorf("payload buffer closed")
+	}
 }
 
 func (buffer *PayloadBuffer) PayloadReceived(payload *Payload) {
-	defer func() {
-		if r := recover(); r != nil {
-			pfxlog.ContextLogger("s/" + buffer.x.sessionId).Error("send on closed channel")
-		}
-	}()
 	pfxlog.Logger().WithFields(payload.GetLoggerFields()).Debug("acknowledging")
 	buffer.transmitBuffer.ReceiveUnordered(payload)
-	buffer.newlyAcknowledged <- payload
-	pfxlog.ContextLogger("s/"+payload.GetSessionId()).Debugf("acknowledge [%d]", payload.GetSequence())
+	select {
+	case buffer.newlyAcknowledged <- payload:
+		pfxlog.ContextLogger("s/"+payload.GetSessionId()).Debugf("acknowledge [%d]", payload.GetSequence())
+	case <-buffer.closeNotify:
+		pfxlog.ContextLogger("s/" + buffer.x.sessionId).Error("payload buffer closed")
+	}
 }
 
 func (buffer *PayloadBuffer) ReceiveAcknowledgement(ack *Acknowledgement) {
-	defer func() {
-		if r := recover(); r != nil {
-			pfxlog.ContextLogger("s/" + buffer.x.sessionId).Error("send on closed channel")
-		}
-	}()
-	buffer.newlyReceivedAcks <- ack
-	pfxlog.ContextLogger("s/"+ack.SessionId).Debugf("received ack [%d]", len(ack.Sequence))
+	select {
+	case buffer.newlyReceivedAcks <- ack:
+		pfxlog.ContextLogger("s/"+ack.SessionId).Debugf("received ack [%+v]", ack.Sequence)
+	case <-buffer.closeNotify:
+		pfxlog.ContextLogger("s/" + ack.SessionId).Error("payload buffer closed")
+	}
 }
 
 func (buffer *PayloadBuffer) Close() {
 	logrus.Debugf("[%p] closing", buffer)
-	defer func() {
-		if r := recover(); r != nil {
-			pfxlog.Logger().Debug("already closed")
+	if buffer.closed.CompareAndSwap(false, true) {
+		close(buffer.closeNotify)
+	}
+}
+
+func (buffer *PayloadBuffer) isBlocked() bool {
+	blocked := false
+
+	if buffer.windowsSize < buffer.txBufferSize {
+		blocked = true
+		if !buffer.blockedByRemoteWindow {
+			buffer.blockedByRemoteWindow = true
+			atomic.AddInt64(&buffer.controller.buffersBlockedByRemoteWindow, 1)
 		}
-	}()
-	close(buffer.newlyBuffered)
-	close(buffer.newlyAcknowledged)
-	close(buffer.newlyReceivedAcks)
+	} else if buffer.blockedByRemoteWindow {
+		buffer.blockedByRemoteWindow = false
+		atomic.AddInt64(&buffer.controller.buffersBlockedByRemoteWindow, -1)
+	}
+
+	if buffer.windowsSize < buffer.rxBufferSize {
+		blocked = true
+		if !buffer.blockedByLocalWindow {
+			buffer.blockedByLocalWindow = true
+			atomic.AddInt64(&buffer.controller.buffersBlockedByLocalWindow, 1)
+		}
+	} else if buffer.blockedByLocalWindow {
+		buffer.blockedByLocalWindow = false
+		atomic.AddInt64(&buffer.controller.buffersBlockedByLocalWindow, -1)
+	}
+
+	pfxlog.Logger().Tracef("blocked=%v tx_buffer_size=%v rx_buffer_size=%v", blocked, buffer.txBufferSize, buffer.rxBufferSize)
+
+	return blocked
 }
 
 func (buffer *PayloadBuffer) run() {
@@ -278,10 +333,12 @@ func (buffer *PayloadBuffer) run() {
 	var buffered chan *payloadAge
 
 	for {
-		if buffer.freeSpace > 0 {
-			buffered = buffer.newlyBuffered
-		} else {
+		rxBufferSizeHistogram.Update(int64(buffer.rxBufferSize))
+
+		if buffer.isBlocked() {
 			buffered = nil
+		} else {
+			buffered = buffer.newlyBuffered
 		}
 
 		now := info.NowInMilliseconds()
@@ -292,62 +349,94 @@ func (buffer *PayloadBuffer) run() {
 
 		select {
 		case ack := <-buffer.newlyReceivedAcks:
-			if ack != nil {
-				if err := buffer.receiveAcknowledgement(ack); err != nil {
-					log.Errorf("unexpected error (%s)", err)
-				}
-			} else {
-				return
+			if err := buffer.receiveAcknowledgement(ack); err != nil {
+				log.Errorf("unexpected error (%s)", err)
 			}
 			if err := buffer.retransmit(); err != nil {
 				log.Errorf("unexpected error retransmitting (%s)", err)
 			}
 
 		case payload := <-buffer.newlyAcknowledged:
-			if payload != nil {
-				if err := buffer.acknowledgePayload(payload); err != nil {
-					log.Errorf("unexpected error (%s)", err)
-				} else if payload.RTT != 0 {
-					buffer.mostRecentRTT = uint16(info.NowInMilliseconds()) - payload.RTT
-				}
-				if err := buffer.acknowledge(); err != nil {
-					log.Errorf("unexpected error (%s)", err)
-				}
-			} else {
-				return
+			if err := buffer.acknowledgePayload(payload); err != nil {
+				log.Errorf("unexpected error (%s)", err)
+			} else if payload.RTT != 0 {
+				buffer.mostRecentRTT = uint16(info.NowInMilliseconds()) - payload.RTT
 			}
+			//if err := buffer.acknowledge(); err != nil {
+			//	log.Errorf("unexpected error (%s)", err)
+			//}
 
 		case payloadAge := <-buffered:
-			if payloadAge != nil {
-				buffer.buffer[payloadAge.payload.GetSequence()] = payloadAge
-				buffer.freeSpace -= uint32(len(payloadAge.payload.Data))
-				if err := buffer.acknowledge(); err != nil {
-					log.Errorf("unexpected error (%s)", err)
-				}
-			} else {
-				return
-			}
+			buffer.buffer[payloadAge.payload.GetSequence()] = payloadAge
+			buffer.rxBufferSize += uint32(len(payloadAge.payload.Data))
+			log.Tracef("buffering payload %v with size %v. payload buffer size: %v",
+				payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.rxBufferSize)
+			//if err := buffer.acknowledge(); err != nil {
+			//	log.Errorf("unexpected error (%s)", err)
+			//}
 
 		case <-time.After(time.Duration(buffer.config.idleAckAfter) * time.Millisecond):
-			if err := buffer.acknowledge(); err != nil {
-				log.Errorf("unexpected error acknowledging (%s)", err)
-			}
+			//if err := buffer.acknowledge(); err != nil {
+			//	log.Errorf("unexpected error acknowledging (%s)", err)
+			//}
 			if err := buffer.retransmit(); err != nil {
 				log.Errorf("unexpected error retransmitting (%s)", err)
 			}
+		case <-buffer.closeNotify:
+			if buffer.blockedByLocalWindow {
+				atomic.AddInt64(&buffer.controller.buffersBlockedByLocalWindow, -1)
+			}
+			if buffer.blockedByRemoteWindow {
+				atomic.AddInt64(&buffer.controller.buffersBlockedByRemoteWindow, -1)
+			}
+			return
 		}
 	}
 }
 
 func (buffer *PayloadBuffer) acknowledgePayload(payload *Payload) error {
-	if buffer.x.sessionId == payload.SessionId {
-		buffer.acked[payload.Sequence] = info.NowInMilliseconds()
-	} else {
+	if buffer.x.sessionId != payload.SessionId {
 		return errors.New("unexpected Payload")
 	}
 
+	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId)
+	log.Debug("ready to acknowledge")
+
+	ack := NewAcknowledgement(buffer.x.sessionId, buffer.x.originator)
+	ack.TxBufferSize = buffer.transmitBuffer.Size()
+	ack.Sequence = append(ack.Sequence, payload.Sequence)
+	if buffer.mostRecentRTT != 0 {
+		ack.RTT = buffer.mostRecentRTT
+		buffer.mostRecentRTT = 0
+	}
+	log.Debugf("acknowledging [%d] payloads, [%d] buffered", len(ack.Sequence), len(buffer.buffer))
+
+	atomic.StoreUint32(&buffer.lastBufferSizeSent, ack.TxBufferSize)
+	buffer.controller.ack(ack, buffer.x.address)
+
 	return nil
 }
+
+func (buffer *PayloadBuffer) SendEmptyAck() {
+	ack := NewAcknowledgement(buffer.x.sessionId, buffer.x.originator)
+	ack.TxBufferSize = buffer.transmitBuffer.Size()
+	atomic.StoreUint32(&buffer.lastBufferSizeSent, ack.TxBufferSize)
+	buffer.controller.ack(ack, buffer.x.address)
+}
+
+func (buffer *PayloadBuffer) getLastBufferSizeSent() uint32 {
+	return atomic.LoadUint32(&buffer.lastBufferSizeSent)
+}
+
+//func (buffer *PayloadBuffer) acknowledgePayload(payload *Payload) error {
+//	if buffer.x.sessionId == payload.SessionId {
+//		buffer.acked[payload.Sequence] = info.NowInMilliseconds()
+//	} else {
+//		return errors.New("unexpected Payload")
+//	}
+//
+//	return nil
+//}
 
 func (buffer *PayloadBuffer) receiveAcknowledgement(ack *Acknowledgement) error {
 	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId)
@@ -356,12 +445,17 @@ func (buffer *PayloadBuffer) receiveAcknowledgement(ack *Acknowledgement) error 
 			if sequence > buffer.receivedAckHwm {
 				buffer.receivedAckHwm = sequence
 			}
-			delete(buffer.buffer, sequence)
-			log.Debugf("acknowledged sequence [%d]", sequence)
+			if payloadAge, found := buffer.buffer[sequence]; found {
+				delete(buffer.buffer, sequence)
+				buffer.rxBufferSize -= uint32(len(payloadAge.payload.Data))
+				log.Tracef("removing payload %v with size %v. payload buffer size: %v",
+					payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.rxBufferSize)
+			}
 		}
-		buffer.freeSpace = ack.FreeSpace
+		buffer.txBufferSize = ack.TxBufferSize
+		remoteTxBufferSizeHistogram.Update(int64(buffer.txBufferSize))
 		if ack.RTT > 0 {
-			buffer.config.retransmitAge = ack.RTT
+			buffer.config.retransmitAge = uint16(float32(ack.RTT) * 1.2)
 			rttHistogram.Update(int64(ack.RTT))
 		}
 	} else {
@@ -378,11 +472,7 @@ func (buffer *PayloadBuffer) acknowledge() error {
 		log.Debug("ready to acknowledge")
 
 		ack := NewAcknowledgement(buffer.x.sessionId, buffer.x.originator)
-		freeSpace := 4*64*1024 - buffer.transmitBuffer.Size()
-		if freeSpace < 0 {
-			freeSpace = 0
-		}
-		ack.FreeSpace = uint32(freeSpace)
+		ack.TxBufferSize = buffer.transmitBuffer.Size()
 		for sequence := range buffer.acked {
 			ack.Sequence = append(ack.Sequence, sequence)
 		}
@@ -396,7 +486,6 @@ func (buffer *PayloadBuffer) acknowledge() error {
 
 		buffer.acked = make(map[int32]int64) // clear
 		buffer.lastAck = now
-
 	} else {
 		log.Debug("not ready to acknowledge")
 	}
