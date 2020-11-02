@@ -159,10 +159,12 @@ func (controller *PayloadBufferController) ackIngester() {
 func (controller *PayloadBufferController) ackSender() {
 	logger := pfxlog.Logger()
 	for nextAck := range controller.ackSend {
+		now := time.Now()
 		if err := controller.forwarder.ForwardAcknowledgement(nextAck.Address, nextAck.Acknowledgement); err != nil {
 			logger.WithError(err).Errorf("unexpected error while sending ack from %v", nextAck.Address)
 			ackFailures.Mark(1)
 		} else {
+			ackWriteTimer.UpdateSince(now)
 			ackTxMeter.Mark(1)
 		}
 	}
@@ -267,22 +269,29 @@ func (buffer *PayloadBuffer) BufferPayload(payload *Payload) (func(), error) {
 }
 
 func (buffer *PayloadBuffer) PayloadReceived(payload *Payload) {
-	pfxlog.Logger().WithFields(payload.GetLoggerFields()).Debug("acknowledging")
-	buffer.transmitBuffer.ReceiveUnordered(payload)
-	select {
-	case buffer.newlyAcknowledged <- payload:
-		pfxlog.ContextLogger("s/"+payload.GetSessionId()).Debugf("acknowledge [%d]", payload.GetSequence())
-	case <-buffer.closeNotify:
-		pfxlog.ContextLogger("s/" + buffer.x.sessionId).Error("payload buffer closed")
+	if buffer.transmitBuffer.Size() < 256*1024 || payload.Sequence < buffer.transmitBuffer.sequence+11 {
+		log := pfxlog.Logger().WithFields(payload.GetLoggerFields())
+		log.Debug("payload received")
+		buffer.transmitBuffer.ReceiveUnordered(payload)
+		select {
+		case buffer.newlyAcknowledged <- payload:
+			log.Debug("payload ackknowledged")
+		case <-buffer.closeNotify:
+			log.Error("payload buffer closed")
+		}
+	} else {
+		droppedPayloadsMeter.Mark(1)
 	}
 }
 
 func (buffer *PayloadBuffer) ReceiveAcknowledgement(ack *Acknowledgement) {
+	log := pfxlog.Logger().WithFields(ack.GetLoggerFields())
+	log.Debug("ack received")
 	select {
 	case buffer.newlyReceivedAcks <- ack:
-		pfxlog.ContextLogger("s/"+ack.SessionId).Debugf("received ack [%+v]", ack.Sequence)
+		log.Debug("ack processed")
 	case <-buffer.closeNotify:
-		pfxlog.ContextLogger("s/" + ack.SessionId).Error("payload buffer closed")
+		log.Error("payload buffer closed")
 	}
 }
 
@@ -399,7 +408,7 @@ func (buffer *PayloadBuffer) acknowledgePayload(payload *Payload) error {
 		return errors.New("unexpected Payload")
 	}
 
-	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId)
+	log := pfxlog.Logger().WithFields(payload.GetLoggerFields())
 	log.Debug("ready to acknowledge")
 
 	ack := NewAcknowledgement(buffer.x.sessionId, buffer.x.originator)
@@ -409,7 +418,7 @@ func (buffer *PayloadBuffer) acknowledgePayload(payload *Payload) error {
 		ack.RTT = buffer.mostRecentRTT
 		buffer.mostRecentRTT = 0
 	}
-	log.Debugf("acknowledging [%d] payloads, [%d] buffered", len(ack.Sequence), len(buffer.buffer))
+	log.Debugf("acknowledging 1 payload, [%d] buffered", len(buffer.buffer))
 
 	atomic.StoreUint32(&buffer.lastBufferSizeSent, ack.TxBufferSize)
 	buffer.controller.ack(ack, buffer.x.address)
@@ -418,6 +427,7 @@ func (buffer *PayloadBuffer) acknowledgePayload(payload *Payload) error {
 }
 
 func (buffer *PayloadBuffer) SendEmptyAck() {
+	pfxlog.Logger().WithField("session", buffer.x.sessionId).Debug("sending empty ack")
 	ack := NewAcknowledgement(buffer.x.sessionId, buffer.x.originator)
 	ack.TxBufferSize = buffer.transmitBuffer.Size()
 	atomic.StoreUint32(&buffer.lastBufferSizeSent, ack.TxBufferSize)
@@ -439,7 +449,7 @@ func (buffer *PayloadBuffer) getLastBufferSizeSent() uint32 {
 //}
 
 func (buffer *PayloadBuffer) receiveAcknowledgement(ack *Acknowledgement) error {
-	log := pfxlog.ContextLogger("s/" + buffer.x.sessionId)
+	log := pfxlog.Logger().WithFields(ack.GetLoggerFields())
 	if buffer.x.sessionId == ack.SessionId {
 		for _, sequence := range ack.Sequence {
 			if sequence > buffer.receivedAckHwm {
@@ -448,7 +458,7 @@ func (buffer *PayloadBuffer) receiveAcknowledgement(ack *Acknowledgement) error 
 			if payloadAge, found := buffer.buffer[sequence]; found {
 				delete(buffer.buffer, sequence)
 				buffer.rxBufferSize -= uint32(len(payloadAge.payload.Data))
-				log.Tracef("removing payload %v with size %v. payload buffer size: %v",
+				log.Debugf("removing payload %v with size %v. payload buffer size: %v",
 					payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.rxBufferSize)
 			}
 		}
@@ -507,7 +517,7 @@ func (buffer *PayloadBuffer) retransmit() error {
 		}
 
 		if retransmitted > 0 {
-			log.Infof("retransmitted [%d] payloads, [%d] buffered", retransmitted, len(buffer.buffer))
+			log.Infof("retransmitted [%d] payloads, [%d] buffered, rxBufferSize", retransmitted, len(buffer.buffer), buffer.rxBufferSize)
 		}
 	}
 	return nil

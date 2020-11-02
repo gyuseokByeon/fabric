@@ -104,6 +104,10 @@ var rttHistogram metrics.Histogram
 var rxBufferSizeHistogram metrics.Histogram
 var localTxBufferSizeHistogram metrics.Histogram
 var remoteTxBufferSizeHistogram metrics.Histogram
+var payloadWriteTimer metrics.Timer
+var ackWriteTimer metrics.Timer
+var payloadBufferTimer metrics.Timer
+var payloadRelayTimer metrics.Timer
 
 func InitMetrics(registry metrics.UsageRegistry) {
 	droppedPayloadsMeter = registry.Meter("xgress.dropped_payloads")
@@ -116,6 +120,10 @@ func InitMetrics(registry metrics.UsageRegistry) {
 	rxBufferSizeHistogram = registry.Histogram("xgress.rx_buffer_size")
 	localTxBufferSizeHistogram = registry.Histogram("xgress.local.tx_buffer_size")
 	remoteTxBufferSizeHistogram = registry.Histogram("xgress.remote.tx_buffer_size")
+	payloadWriteTimer = registry.Timer("xgress.tx_write_time")
+	ackWriteTimer = registry.Timer("xgress.ack_write_time")
+	payloadBufferTimer = registry.Timer("xgress.payload_buffer_time")
+	payloadRelayTimer = registry.Timer("xgress.payload_relay_time")
 }
 
 type Xgress struct {
@@ -254,6 +262,10 @@ func (self *Xgress) Closed() bool {
 }
 
 func (self *Xgress) SendPayload(payload *Payload) error {
+	if self.closed.Get() {
+		return nil
+	}
+
 	defer func() {
 		if r := recover(); r != nil {
 			pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields()).
@@ -266,19 +278,8 @@ func (self *Xgress) SendPayload(payload *Payload) error {
 		pfxlog.ContextLogger(self.Label()).Debug("received end of session Payload")
 	}
 
-	if !self.closed.Get() {
-		pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields()).Debug("queuing to txQueue")
-		if payload.IsSessionEndFlagSet() {
-			self.txQueue <- payload
-		} else {
-			select {
-			case self.txQueue <- payload:
-			default:
-				droppedPayloadsMeter.Mark(1)
-				pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields()).Debug("dropped from txqueue")
-			}
-		}
-	}
+	self.payloadIngester(payload)
+
 	return nil
 }
 
@@ -288,78 +289,75 @@ func (self *Xgress) SendAcknowledgement(acknowledgement *Acknowledgement) error 
 	return nil
 }
 
+func (self *Xgress) payloadIngester(payload *Payload) {
+	log := pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields())
+
+	if payload.IsSessionStartFlagSet() {
+		log.Debug("received session start, starting xgress receiver")
+		go self.rx()
+	}
+
+	start := time.Now()
+	if !self.Options.RandomDrops || rand.Int31n(self.Options.Drop1InN) != 1 {
+		log.Debug("adding to transmit buffer")
+		self.payloadBuffer.PayloadReceived(payload)
+	} else {
+		log.Error("drop!")
+	}
+	next := time.Now()
+	payloadBufferTimer.Update(next.Sub(start))
+
+	txPayload := self.payloadBuffer.transmitBuffer.NextReadyPayload()
+	for txPayload != nil {
+		select {
+		case self.txQueue <- txPayload:
+			self.payloadBuffer.transmitBuffer.RemoveReadyPayload()
+			txPayload = self.payloadBuffer.transmitBuffer.NextReadyPayload()
+		default:
+			txPayload = nil
+		}
+	}
+	payloadRelayTimer.UpdateSince(next)
+}
+
 func (self *Xgress) tx() {
 	log := pfxlog.ContextLogger(self.Label())
 
 	log.Debug("started")
 	defer log.Debug("exited")
 
-	var inPayload *Payload
-	var outPayload *Payload
-	done := false
+	var payload *Payload
 
 	for {
-		if outPayload == nil && !done {
-			select {
-			case inPayload = <-self.txQueue:
-				if inPayload == nil || inPayload.IsSessionEndFlagSet() {
-					done = true
-				}
-			}
-		} else {
-			select {
-			case inPayload = <-self.txQueue:
-				if inPayload == nil || inPayload.IsSessionEndFlagSet() {
-					done = true
-				}
-			default:
-				inPayload = nil
-			}
-		}
-
-		if inPayload != nil {
-			if inPayload.IsSessionStartFlagSet() {
-				log.Debug("received session start, starting xgress receiver")
-				go self.rx()
-			}
-			payloadLogger := log.WithFields(inPayload.GetLoggerFields())
-			if !self.Options.RandomDrops || rand.Int31n(self.Options.Drop1InN) != 1 {
-				payloadLogger.Debug("adding to transmit buffer")
-				self.payloadBuffer.PayloadReceived(inPayload)
-			} else {
-				payloadLogger.Error("drop!")
-			}
-		}
-
-		if outPayload != nil {
-			outPayloadLogger := log.WithFields(outPayload.GetLoggerFields())
-			for _, peekHandler := range self.peekHandlers {
-				peekHandler.Tx(self, outPayload)
-			}
-			if !outPayload.IsSessionStartFlagSet() {
-				n, err := self.peer.WritePayload(outPayload.Data, outPayload.Headers)
-				if err != nil {
-					outPayloadLogger.Warnf("write failed (%s), closing xgress", err)
-					self.Close()
-					return
-				} else {
-					outPayloadLogger.Debugf("sent (#%d) [%s]", outPayload.GetSequence(), info.ByteCount(int64(n)))
-				}
-			}
-			payloadSize := len(outPayload.Data)
-			size := atomic.AddUint32(&self.payloadBuffer.transmitBuffer.size, ^uint32(payloadSize-1))
-			pfxlog.Logger().Infof("Payload %v of size %v removed from transmit buffer. New size: %v", outPayload.Sequence, payloadSize, size)
-			localTxBufferSizeHistogram.Update(int64(size))
-
-			lastBufferSizeSent := self.payloadBuffer.getLastBufferSizeSent()
-			if lastBufferSizeSent > 10000 && (size<<1) > lastBufferSizeSent {
-				self.payloadBuffer.SendEmptyAck()
-			}
-		}
-
-		outPayload = self.payloadBuffer.transmitBuffer.NextReadyPayload()
-		if outPayload == nil && done {
+		payload = <-self.txQueue
+		if payload == nil || payload.IsSessionEndFlagSet() {
 			return
+		}
+
+		payloadLogger := log.WithFields(payload.GetLoggerFields())
+		for _, peekHandler := range self.peekHandlers {
+			peekHandler.Tx(self, payload)
+		}
+		if !payload.IsSessionStartFlagSet() && !payload.IsSessionEndFlagSet() {
+			start := time.Now()
+			n, err := self.peer.WritePayload(payload.Data, payload.Headers)
+			if err != nil {
+				payloadLogger.Warnf("write failed (%s), closing xgress", err)
+				self.Close()
+				return
+			} else {
+				payloadWriteTimer.UpdateSince(start)
+				payloadLogger.Debugf("sent (#%d) [%s]", payload.GetSequence(), info.ByteCount(int64(n)))
+			}
+		}
+		payloadSize := len(payload.Data)
+		size := atomic.AddUint32(&self.payloadBuffer.transmitBuffer.size, ^uint32(payloadSize-1))
+		pfxlog.Logger().Debugf("Payload %v of size %v removed from transmit buffer. New size: %v", payload.Sequence, payloadSize, size)
+		localTxBufferSizeHistogram.Update(int64(size))
+
+		lastBufferSizeSent := self.payloadBuffer.getLastBufferSizeSent()
+		if lastBufferSizeSent > 10000 && (size<<1) > lastBufferSizeSent {
+			self.payloadBuffer.SendEmptyAck()
 		}
 	}
 }

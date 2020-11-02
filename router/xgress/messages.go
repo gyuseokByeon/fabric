@@ -186,6 +186,15 @@ func UnmarshallAcknowledgement(msg *channel2.Message) (*Acknowledgement, error) 
 	return ack, nil
 }
 
+func (ack *Acknowledgement) GetLoggerFields() logrus.Fields {
+	return logrus.Fields{
+		"session":      ack.SessionId,
+		"txBufferSize": ack.TxBufferSize,
+		"seq":          fmt.Sprintf("%+v", ack.Sequence),
+		"RTT":          ack.RTT,
+	}
+}
+
 type Payload struct {
 	Header
 	Sequence int32
@@ -261,8 +270,9 @@ func SetOriginatorFlag(flags uint32, originator Originator) uint32 {
 
 func (payload *Payload) GetLoggerFields() logrus.Fields {
 	return logrus.Fields{
-		"seq":    payload.Sequence,
-		"origin": payload.GetOriginator(),
-		"uuid":   uuidz.ToString(payload.Headers[HeaderKeyUUID]),
+		"session": payload.SessionId,
+		"seq":     payload.Sequence,
+		"origin":  payload.GetOriginator(),
+		"uuid":    uuidz.ToString(payload.Headers[HeaderKeyUUID]),
 	}
 }

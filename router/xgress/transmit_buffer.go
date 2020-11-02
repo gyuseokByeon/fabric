@@ -47,11 +47,10 @@ func (buffer *TransmitBuffer) ReceiveUnordered(payload *Payload) {
 		if buffer.tree.Size() > treeSize {
 			payloadSize := len(payload.Data)
 			size := atomic.AddUint32(&buffer.size, uint32(payloadSize))
-			pfxlog.Logger().Infof("Payload %v of size %v added to transmit buffer. New size: %v", payload.Sequence, payloadSize, size)
+			pfxlog.Logger().Tracef("Payload %v of size %v added to transmit buffer. New size: %v", payload.Sequence, payloadSize, size)
 			localTxBufferSizeHistogram.Update(int64(size))
 		}
 	}
-
 }
 
 func (buffer *TransmitBuffer) ReadyForTransmit() []*Payload {
@@ -77,20 +76,16 @@ func (buffer *TransmitBuffer) ReadyForTransmit() []*Payload {
 }
 
 func (buffer *TransmitBuffer) NextReadyPayload() *Payload {
-	var payload *Payload
 	if buffer.tree.LeftKey() != nil {
-		nextSequence := buffer.tree.LeftKey().(int32)
-		if nextSequence == buffer.sequence+1 {
-			payload = buffer.tree.LeftValue().(*Payload)
-
-			buffer.tree.Remove(nextSequence)
-			buffer.sequence = nextSequence
-
-			if buffer.tree.Size() > 0 {
-				nextSequence = buffer.tree.LeftKey().(int32)
-			}
+		if nextSequence := buffer.tree.LeftKey().(int32); nextSequence == buffer.sequence+1 {
+			return buffer.tree.LeftValue().(*Payload)
 		}
 	}
+	return nil
+}
 
-	return payload
+func (buffer *TransmitBuffer) RemoveReadyPayload() {
+	nextSequence := buffer.tree.LeftKey().(int32)
+	buffer.tree.Remove(nextSequence)
+	buffer.sequence = nextSequence
 }
