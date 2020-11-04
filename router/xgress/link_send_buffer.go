@@ -251,7 +251,7 @@ func (buffer *LinkSendBuffer) retransmit() error {
 		}
 
 		if retransmitted > 0 {
-			log.Infof("retransmitted [%d] payloads, [%d] buffered, rxBufferSize", retransmitted, len(buffer.buffer), buffer.rxBufferSize)
+			log.Infof("retransmitted [%d] payloads, [%d] buffered, rxBufferSize: %d", retransmitted, len(buffer.buffer), buffer.rxBufferSize)
 		}
 	}
 	return nil
