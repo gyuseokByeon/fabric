@@ -23,24 +23,25 @@ import (
 	"sync/atomic"
 )
 
-type TransmitBuffer struct {
-	tree     *btree.Tree
-	sequence int32
-	size     uint32
+type LinkReceiveBuffer struct {
+	tree               *btree.Tree
+	sequence           int32
+	size               uint32
+	lastBufferSizeSent uint32
 }
 
-func NewTransmitBuffer() *TransmitBuffer {
-	return &TransmitBuffer{
+func NewLinkReceiveBuffer() *LinkReceiveBuffer {
+	return &LinkReceiveBuffer{
 		tree:     btree.NewWith(10240, utils.Int32Comparator),
 		sequence: -1,
 	}
 }
 
-func (buffer *TransmitBuffer) Size() uint32 {
+func (buffer *LinkReceiveBuffer) Size() uint32 {
 	return atomic.LoadUint32(&buffer.size)
 }
 
-func (buffer *TransmitBuffer) ReceiveUnordered(payload *Payload) {
+func (buffer *LinkReceiveBuffer) ReceiveUnordered(payload *Payload) {
 	if payload.GetSequence() > buffer.sequence {
 		treeSize := buffer.tree.Size()
 		buffer.tree.Put(payload.GetSequence(), payload)
@@ -53,29 +54,7 @@ func (buffer *TransmitBuffer) ReceiveUnordered(payload *Payload) {
 	}
 }
 
-func (buffer *TransmitBuffer) ReadyForTransmit() []*Payload {
-	var ready []*Payload
-
-	if buffer.tree.LeftKey() != nil {
-		nextSequence := buffer.tree.LeftKey().(int32)
-		for nextSequence == buffer.sequence+1 {
-			payload := buffer.tree.LeftValue().(*Payload)
-
-			buffer.tree.Remove(nextSequence)
-			buffer.sequence = nextSequence
-
-			ready = append(ready, payload)
-
-			if buffer.tree.Size() > 0 {
-				nextSequence = buffer.tree.LeftKey().(int32)
-			}
-		}
-	}
-
-	return ready
-}
-
-func (buffer *TransmitBuffer) NextReadyPayload() *Payload {
+func (buffer *LinkReceiveBuffer) NextReadyPayload() *Payload {
 	if buffer.tree.LeftKey() != nil {
 		if nextSequence := buffer.tree.LeftKey().(int32); nextSequence == buffer.sequence+1 {
 			return buffer.tree.LeftValue().(*Payload)
@@ -84,8 +63,12 @@ func (buffer *TransmitBuffer) NextReadyPayload() *Payload {
 	return nil
 }
 
-func (buffer *TransmitBuffer) RemoveReadyPayload() {
+func (buffer *LinkReceiveBuffer) RemoveReadyPayload() {
 	nextSequence := buffer.tree.LeftKey().(int32)
 	buffer.tree.Remove(nextSequence)
 	buffer.sequence = nextSequence
+}
+
+func (buffer *LinkReceiveBuffer) getLastBufferSizeSent() uint32 {
+	return atomic.LoadUint32(&buffer.lastBufferSizeSent)
 }
