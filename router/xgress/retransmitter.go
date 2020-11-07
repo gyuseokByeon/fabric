@@ -74,12 +74,15 @@ func (retransmitter *Retransmitter) retransmitIngester() {
 func (retransmitter *Retransmitter) retransmitSender() {
 	logger := pfxlog.Logger()
 	for retransmit := range retransmitter.retransmitSend {
-		if err := retransmitter.forwarder.ForwardPayload(retransmit.Address, retransmit.payloadAge.payload); err != nil {
-			logger.WithError(err).Errorf("unexpected error while retransmitting payload from %v", retransmit.Address)
-			retransmissionFailures.Mark(1)
-		} else {
-			retransmissions.Mark(1)
-			retransmit.markSent()
+		if !retransmit.isAcked() {
+			if err := retransmitter.forwarder.ForwardPayload(retransmit.Address, retransmit.payloadAge.payload); err != nil {
+				logger.WithError(err).Errorf("unexpected error while retransmitting payload from %v", retransmit.Address)
+				retransmissionFailures.Mark(1)
+			} else {
+				retransmit.markSent()
+				retransmissions.Mark(1)
+			}
+			retransmit.dequeued()
 		}
 	}
 }

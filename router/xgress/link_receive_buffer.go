@@ -26,6 +26,7 @@ import (
 type LinkReceiveBuffer struct {
 	tree               *btree.Tree
 	sequence           int32
+	maxSequence        int32
 	size               uint32
 	lastBufferSizeSent uint32
 }
@@ -41,17 +42,29 @@ func (buffer *LinkReceiveBuffer) Size() uint32 {
 	return atomic.LoadUint32(&buffer.size)
 }
 
-func (buffer *LinkReceiveBuffer) ReceiveUnordered(payload *Payload) {
-	if payload.GetSequence() > buffer.sequence {
-		treeSize := buffer.tree.Size()
-		buffer.tree.Put(payload.GetSequence(), payload)
-		if buffer.tree.Size() > treeSize {
-			payloadSize := len(payload.Data)
-			size := atomic.AddUint32(&buffer.size, uint32(payloadSize))
-			pfxlog.Logger().Tracef("Payload %v of size %v added to transmit buffer. New size: %v", payload.Sequence, payloadSize, size)
-			localTxBufferSizeHistogram.Update(int64(size))
+func (buffer *LinkReceiveBuffer) ReceiveUnordered(payload *Payload, maxSize uint32) bool {
+	if payload.GetSequence() <= buffer.sequence {
+		return true
+	}
+
+	if buffer.size > maxSize && payload.Sequence > buffer.maxSequence {
+		droppedPayloadsMeter.Mark(1)
+		return false
+	}
+
+	treeSize := buffer.tree.Size()
+	buffer.tree.Put(payload.GetSequence(), payload)
+	if buffer.tree.Size() > treeSize {
+		payloadSize := len(payload.Data)
+		size := atomic.AddUint32(&buffer.size, uint32(payloadSize))
+		pfxlog.Logger().Tracef("Payload %v of size %v added to transmit buffer. New size: %v", payload.Sequence, payloadSize, size)
+		localRecvBufferSizeBytesHistogram.Update(int64(size))
+		if payload.Sequence > buffer.maxSequence {
+			buffer.maxSequence = payload.Sequence
 		}
 	}
+	localRecvBufferSizeMsgsHistogram.Update(int64(buffer.tree.Size()))
+	return true
 }
 
 func (buffer *LinkReceiveBuffer) NextReadyPayload() *Payload {
@@ -67,6 +80,7 @@ func (buffer *LinkReceiveBuffer) RemoveReadyPayload() {
 	nextSequence := buffer.tree.LeftKey().(int32)
 	buffer.tree.Remove(nextSequence)
 	buffer.sequence = nextSequence
+	localRecvBufferSizeMsgsHistogram.Update(int64(buffer.tree.Size()))
 }
 
 func (buffer *LinkReceiveBuffer) getLastBufferSizeSent() uint32 {

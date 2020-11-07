@@ -24,7 +24,6 @@ import (
 	"github.com/openziti/foundation/util/concurrenz"
 	"github.com/openziti/foundation/util/info"
 	"github.com/openziti/foundation/util/mathz"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"io"
 	"math/rand"
@@ -245,7 +244,7 @@ func (self *Xgress) SendPayload(payload *Payload) error {
 		pfxlog.ContextLogger(self.Label()).Debug("received end of session Payload")
 	}
 
-	self.payloadIngester(payload)
+	payloadIngester.ingest(payload, self)
 
 	return nil
 }
@@ -257,23 +256,24 @@ func (self *Xgress) SendAcknowledgement(acknowledgement *Acknowledgement) error 
 }
 
 func (self *Xgress) payloadIngester(payload *Payload) {
-	log := pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields())
-
 	if payload.IsSessionStartFlagSet() {
-		log.Debug("received session start, starting xgress receiver")
+		pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields()).Debug("received session start, starting xgress receiver")
 		go self.rx()
 	}
 
 	start := time.Now()
 	if !self.Options.RandomDrops || rand.Int31n(self.Options.Drop1InN) != 1 {
-		log.Debug("adding to transmit buffer")
 		self.PayloadReceived(payload)
 	} else {
-		log.Error("drop!")
+		pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields()).Error("drop!")
 	}
 	next := time.Now()
 	payloadBufferTimer.Update(next.Sub(start))
+	self.queueSends()
+	payloadRelayTimer.UpdateSince(next)
+}
 
+func (self *Xgress) queueSends() {
 	txPayload := self.linkRxBuffer.NextReadyPayload()
 	for txPayload != nil {
 		select {
@@ -284,7 +284,6 @@ func (self *Xgress) payloadIngester(payload *Payload) {
 			txPayload = nil
 		}
 	}
-	payloadRelayTimer.UpdateSince(next)
 }
 
 func (self *Xgress) tx() {
@@ -296,7 +295,13 @@ func (self *Xgress) tx() {
 	var payload *Payload
 
 	for {
-		payload = <-self.txQueue
+		select {
+		case payload = <-self.txQueue:
+		default:
+			payloadIngester.payloadSendReq <- self
+			payload = <-self.txQueue
+		}
+
 		if payload == nil || payload.IsSessionEndFlagSet() {
 			return
 		}
@@ -320,10 +325,10 @@ func (self *Xgress) tx() {
 		payloadSize := len(payload.Data)
 		size := atomic.AddUint32(&self.linkRxBuffer.size, ^uint32(payloadSize-1))
 		pfxlog.Logger().Debugf("Payload %v of size %v removed from transmit buffer. New size: %v", payload.Sequence, payloadSize, size)
-		localTxBufferSizeHistogram.Update(int64(size))
+		localRecvBufferSizeBytesHistogram.Update(int64(size))
 
 		lastBufferSizeSent := self.linkRxBuffer.getLastBufferSizeSent()
-		if lastBufferSizeSent > 10000 && (size<<1) > lastBufferSizeSent {
+		if lastBufferSizeSent > 10000 && (lastBufferSizeSent>>1) > size {
 			self.SendEmptyAck()
 		}
 	}
@@ -427,41 +432,31 @@ func (self *Xgress) closeTimeoutHandler(duration time.Duration) {
 }
 
 func (self *Xgress) PayloadReceived(payload *Payload) {
-	if self.linkRxBuffer.Size() < 256*1024 || payload.Sequence < self.linkRxBuffer.sequence+11 {
-		log := pfxlog.Logger().WithFields(payload.GetLoggerFields())
-		log.Debug("payload received")
-		self.linkRxBuffer.ReceiveUnordered(payload)
-		if err := self.acknowledgePayload(payload); err != nil {
-			log.WithError(err).Error("unexpected error acknowledging payload")
-		}
-	} else {
-		droppedPayloadsMeter.Mark(1)
-	}
-}
-
-func (self *Xgress) acknowledgePayload(payload *Payload) error {
-	if self.sessionId != payload.SessionId {
-		return errors.New("unexpected Payload")
-	}
-
 	log := pfxlog.Logger().WithFields(payload.GetLoggerFields())
-	log.Debug("ready to acknowledge")
+	log.Debug("payload received")
+	if self.linkRxBuffer.ReceiveUnordered(payload, self.Options.RxBufferSize) {
+		if self.sessionId != payload.SessionId {
+			pfxlog.Logger().WithField("session", self.sessionId).Errorf("payload for session=%v routed to wrong xgress", payload.SessionId)
+			return
+		}
 
-	ack := NewAcknowledgement(self.sessionId, self.originator)
-	ack.TxBufferSize = self.linkRxBuffer.Size()
-	ack.Sequence = append(ack.Sequence, payload.Sequence)
-	ack.RTT = payload.RTT
+		log := pfxlog.Logger().WithFields(payload.GetLoggerFields())
+		log.Debug("ready to acknowledge")
 
-	atomic.StoreUint32(&self.linkRxBuffer.lastBufferSizeSent, ack.TxBufferSize)
-	acker.ack(ack, self.address)
+		ack := NewAcknowledgement(self.sessionId, self.originator)
+		ack.RecvBufferSize = self.linkRxBuffer.Size()
+		ack.Sequence = append(ack.Sequence, payload.Sequence)
+		ack.RTT = payload.RTT
 
-	return nil
+		atomic.StoreUint32(&self.linkRxBuffer.lastBufferSizeSent, ack.RecvBufferSize)
+		acker.ack(ack, self.address)
+	}
 }
 
 func (self *Xgress) SendEmptyAck() {
 	pfxlog.Logger().WithField("session", self.sessionId).Debug("sending empty ack")
 	ack := NewAcknowledgement(self.sessionId, self.originator)
-	ack.TxBufferSize = self.linkRxBuffer.Size()
-	atomic.StoreUint32(&self.linkRxBuffer.lastBufferSizeSent, ack.TxBufferSize)
+	ack.RecvBufferSize = self.linkRxBuffer.Size()
+	atomic.StoreUint32(&self.linkRxBuffer.lastBufferSizeSent, ack.RecvBufferSize)
 	acker.ack(ack, self.address)
 }

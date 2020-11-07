@@ -14,6 +14,11 @@ func InitAcker(forwarder PayloadBufferForwarder, metrics metrics.Registry) {
 	acker = NewAcker(forwarder, metrics)
 }
 
+type ackEntry struct {
+	Address
+	*Acknowledgement
+}
+
 type Acker struct {
 	forwarder     PayloadBufferForwarder
 	acks          *deque.Deque

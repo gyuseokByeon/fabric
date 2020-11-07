@@ -40,27 +40,30 @@ type LinkSendBuffer struct {
 	x                     *Xgress
 	buffer                map[int32]*payloadAge
 	newlyBuffered         chan *payloadAge
-	lastAck               int64
 	newlyReceivedAcks     chan *Acknowledgement
-	receivedAckHwm        int32
 	windowsSize           uint32
-	rxBufferSize          uint32
-	txBufferSize          uint32
+	linkSendBufferSize    uint32
+	linkRecvBufferSize    uint32
 	accumulator           uint32
+	successfulAcks        uint32
+	duplicateAcks         uint32
+	retransmits           uint32
 	closeNotify           chan struct{}
 	closed                concurrenz.AtomicBoolean
 	blockedByLocalWindow  bool
 	blockedByRemoteWindow bool
+	retransmitAge         uint32
+	lastRetransmitTime    int64
 
 	config struct {
-		retransmitAge uint16
-		idleAckAfter  int64
+		idleAckAfter int64
 	}
 }
 
 type payloadAge struct {
-	payload *Payload
-	age     int64
+	payload    *Payload
+	age        int64
+	retxQueued int32
 }
 
 func (self *payloadAge) markSent() {
@@ -71,19 +74,37 @@ func (self *payloadAge) getAge() int64 {
 	return atomic.LoadInt64(&self.age)
 }
 
+func (self *payloadAge) markQueued() {
+	atomic.AddInt32(&self.retxQueued, 1)
+}
+
+func (self *payloadAge) markAcked() {
+	atomic.AddInt32(&self.retxQueued, 1)
+}
+
+func (self *payloadAge) dequeued() {
+	atomic.AddInt32(&self.retxQueued, -1)
+}
+
+func (self *payloadAge) isAcked() bool {
+	return atomic.LoadInt32(&self.retxQueued) > 1
+}
+
+func (self *payloadAge) isRetransmittable() bool {
+	return atomic.LoadInt32(&self.retxQueued) == 0
+}
+
 func NewLinkSendBuffer(x *Xgress) *LinkSendBuffer {
 	buffer := &LinkSendBuffer{
 		x:                 x,
 		buffer:            make(map[int32]*payloadAge),
 		newlyBuffered:     make(chan *payloadAge, x.Options.TxQueueSize),
-		lastAck:           info.NowInMilliseconds(),
 		newlyReceivedAcks: make(chan *Acknowledgement),
-		receivedAckHwm:    -1,
-		windowsSize:       256 * 1024,
+		windowsSize:       x.Options.TxPortalStartSize,
 		closeNotify:       make(chan struct{}),
 	}
 
-	buffer.config.retransmitAge = 2000
+	buffer.retransmitAge = 2000
 	buffer.config.idleAckAfter = 5000
 
 	go buffer.run()
@@ -126,7 +147,7 @@ func (buffer *LinkSendBuffer) Close() {
 func (buffer *LinkSendBuffer) isBlocked() bool {
 	blocked := false
 
-	if buffer.windowsSize < buffer.txBufferSize {
+	if buffer.windowsSize < buffer.linkRecvBufferSize {
 		blocked = true
 		if !buffer.blockedByRemoteWindow {
 			buffer.blockedByRemoteWindow = true
@@ -137,7 +158,7 @@ func (buffer *LinkSendBuffer) isBlocked() bool {
 		atomic.AddInt64(&buffersBlockedByRemoteWindow, -1)
 	}
 
-	if buffer.windowsSize < buffer.rxBufferSize {
+	if buffer.windowsSize < buffer.linkSendBufferSize {
 		blocked = true
 		if !buffer.blockedByLocalWindow {
 			buffer.blockedByLocalWindow = true
@@ -149,7 +170,7 @@ func (buffer *LinkSendBuffer) isBlocked() bool {
 	}
 
 	if blocked {
-		pfxlog.Logger().Infof("blocked=%v win_size=%v tx_buffer_size=%v rx_buffer_size=%v", blocked, buffer.windowsSize, buffer.txBufferSize, buffer.rxBufferSize)
+		pfxlog.Logger().Debugf("blocked=%v win_size=%v tx_buffer_size=%v rx_buffer_size=%v", blocked, buffer.windowsSize, buffer.linkRecvBufferSize, buffer.linkSendBufferSize)
 	}
 
 	return blocked
@@ -160,12 +181,13 @@ func (buffer *LinkSendBuffer) run() {
 	defer log.Debugf("[%p] exited", buffer)
 	log.Debugf("[%p] started", buffer)
 
-	lastDebug := info.NowInMilliseconds()
-
 	var buffered chan *payloadAge
 
+	retransmitTicker := time.NewTicker(100 * time.Millisecond)
+
 	for {
-		rxBufferSizeHistogram.Update(int64(buffer.rxBufferSize))
+		txBufferSizeHistogram.Update(int64(buffer.linkSendBufferSize))
+		txWindowSize.Update(int64(buffer.windowsSize))
 
 		if buffer.isBlocked() {
 			buffered = nil
@@ -173,31 +195,19 @@ func (buffer *LinkSendBuffer) run() {
 			buffered = buffer.newlyBuffered
 		}
 
-		now := info.NowInMilliseconds()
-		if now-lastDebug >= 2000 {
-			buffer.debug(now)
-			lastDebug = now
-		}
-
 		select {
 		case ack := <-buffer.newlyReceivedAcks:
-			if err := buffer.receiveAcknowledgement(ack); err != nil {
-				log.Errorf("unexpected error (%s)", err)
-			}
-			if err := buffer.retransmit(); err != nil {
-				log.Errorf("unexpected error retransmitting (%s)", err)
-			}
+			buffer.receiveAcknowledgement(ack)
+			buffer.retransmit()
 
 		case payloadAge := <-buffered:
 			buffer.buffer[payloadAge.payload.GetSequence()] = payloadAge
-			buffer.rxBufferSize += uint32(len(payloadAge.payload.Data))
+			buffer.linkSendBufferSize += uint32(len(payloadAge.payload.Data))
 			log.Tracef("buffering payload %v with size %v. payload buffer size: %v",
-				payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.rxBufferSize)
+				payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.linkSendBufferSize)
 
-		case <-time.After(time.Duration(buffer.config.idleAckAfter) * time.Millisecond):
-			if err := buffer.retransmit(); err != nil {
-				log.Errorf("unexpected error retransmitting (%s)", err)
-			}
+		case <-retransmitTicker.C:
+			buffer.retransmit()
 
 		case <-buffer.closeNotify:
 			if buffer.blockedByLocalWindow {
@@ -211,55 +221,87 @@ func (buffer *LinkSendBuffer) run() {
 	}
 }
 
-func (buffer *LinkSendBuffer) receiveAcknowledgement(ack *Acknowledgement) error {
+func (buffer *LinkSendBuffer) receiveAcknowledgement(ack *Acknowledgement) {
 	log := pfxlog.Logger().WithFields(ack.GetLoggerFields())
-	if buffer.x.sessionId == ack.SessionId {
-		for _, sequence := range ack.Sequence {
-			if sequence > buffer.receivedAckHwm {
-				buffer.receivedAckHwm = sequence
-			}
-			if payloadAge, found := buffer.buffer[sequence]; found {
-				delete(buffer.buffer, sequence)
-				buffer.rxBufferSize -= uint32(len(payloadAge.payload.Data))
-				log.Debugf("removing payload %v with size %v. payload buffer size: %v",
-					payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.rxBufferSize)
-			}
-		}
-		buffer.txBufferSize = ack.TxBufferSize
-		remoteTxBufferSizeHistogram.Update(int64(buffer.txBufferSize))
-		if ack.RTT > 0 {
-			buffer.config.retransmitAge = uint16(float32(ack.RTT) * 1.2)
-			rttHistogram.Update(int64(ack.RTT))
-		}
-	} else {
-		return errors.New("unexpected acknowledgement")
+	if buffer.x.sessionId != ack.SessionId {
+		log.Errorf("unexpected acknowledgement. session=%v, but ack is for session=%v", buffer.x.sessionId, ack.Sequence)
+		return
 	}
-	return nil
+
+	for _, sequence := range ack.Sequence {
+		if payloadAge, found := buffer.buffer[sequence]; found {
+			payloadAge.markAcked()
+
+			payloadSize := uint32(len(payloadAge.payload.Data))
+			buffer.accumulator += payloadSize
+			buffer.successfulAcks++
+			delete(buffer.buffer, sequence)
+			buffer.linkSendBufferSize -= payloadSize
+			log.Debugf("removing payload %v with size %v. payload buffer size: %v",
+				payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.linkSendBufferSize)
+
+			if buffer.successfulAcks >= buffer.x.Options.TxPortalIncreaseThresh {
+				buffer.successfulAcks = 0
+				delta := uint32(float64(buffer.accumulator) * buffer.x.Options.TxPortalIncreaseScale)
+				buffer.windowsSize += delta
+				if buffer.windowsSize > buffer.x.Options.TxPortalMaxSize {
+					buffer.windowsSize = buffer.x.Options.TxPortalMaxSize
+				}
+			}
+		} else { // duplicate ack
+			duplicateAcksMeter.Mark(1)
+			buffer.duplicateAcks++
+			if buffer.duplicateAcks >= buffer.x.Options.TxPortalDupAckThresh {
+				buffer.duplicateAcks = 0
+				buffer.scale(buffer.x.Options.TxPortalDupAckScale)
+			}
+		}
+	}
+
+	buffer.linkRecvBufferSize = ack.RecvBufferSize
+	remoteRecvBufferSizeHistogram.Update(int64(buffer.linkRecvBufferSize))
+	if ack.RTT > 0 {
+		buffer.retransmitAge = uint32(float64(ack.RTT)*buffer.x.Options.RetxScale) + buffer.x.Options.RetxAddMs
+		rttHistogram.Update(int64(ack.RTT))
+	}
 }
 
-func (buffer *LinkSendBuffer) retransmit() error {
-	if len(buffer.buffer) > 0 {
+func (buffer *LinkSendBuffer) retransmit() {
+	now := info.NowInMilliseconds()
+	if len(buffer.buffer) > 0 && (now-buffer.lastRetransmitTime) > 64 {
 		log := pfxlog.ContextLogger(fmt.Sprintf("s/" + buffer.x.sessionId))
 
-		now := info.NowInMilliseconds()
 		retransmitted := 0
 		for _, v := range buffer.buffer {
-			if v.payload.GetSequence() < buffer.receivedAckHwm && uint16(now-v.getAge()) > buffer.config.retransmitAge {
+			if v.isRetransmittable() && uint32(now-v.getAge()) >= buffer.retransmitAge {
+				v.markQueued()
 				retransmitter.retransmit(v, buffer.x.address)
 				retransmitted++
+				buffer.retransmits++
+				if buffer.retransmits >= buffer.x.Options.TxPortalRetxThresh {
+					buffer.retransmits = 0
+					buffer.scale(buffer.x.Options.TxPortalRetxScale)
+				}
 			}
 		}
 
 		if retransmitted > 0 {
-			log.Infof("retransmitted [%d] payloads, [%d] buffered, rxBufferSize: %d", retransmitted, len(buffer.buffer), buffer.rxBufferSize)
+			log.Infof("retransmitted [%d] payloads, [%d] buffered, linkSendBufferSize: %d", retransmitted, len(buffer.buffer), buffer.linkSendBufferSize)
 		}
+		buffer.lastRetransmitTime = now
 	}
-	return nil
 }
 
-func (buffer *LinkSendBuffer) debug(now int64) {
-	pfxlog.ContextLogger(buffer.x.sessionId).Debugf("buffer=[%d], lastAck=[%d ms.], receivedAckHwm=[%d]",
-		len(buffer.buffer), now-buffer.lastAck, buffer.receivedAckHwm)
+func (buffer *LinkSendBuffer) scale(factor float64) {
+	buffer.windowsSize = uint32(float64(buffer.windowsSize) * factor)
+	if factor > 1 {
+		if buffer.windowsSize > buffer.x.Options.TxPortalMaxSize {
+			buffer.windowsSize = buffer.x.Options.TxPortalMaxSize
+		}
+	} else if buffer.windowsSize < buffer.x.Options.TxPortalMinSize {
+		buffer.windowsSize = buffer.x.Options.TxPortalMinSize
+
+	}
 }
 
 type retransmit struct {
@@ -280,9 +322,4 @@ func (r *retransmit) Compare(comparable llrb.Comparable) int {
 	}
 	pfxlog.Logger().Errorf("*retransmit was compared to %v, which should not happen", reflect.TypeOf(comparable))
 	return -1
-}
-
-type ackEntry struct {
-	Address
-	*Acknowledgement
 }
