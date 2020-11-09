@@ -18,15 +18,12 @@ package xgress
 
 import (
 	"fmt"
-	"github.com/biogo/store/llrb"
 	"github.com/michaelquigley/pfxlog"
 	"github.com/openziti/foundation/util/concurrenz"
 	"github.com/openziti/foundation/util/info"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"math"
-	"reflect"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -78,8 +75,9 @@ func (self *payloadAge) markQueued() {
 	atomic.AddInt32(&self.retxQueued, 1)
 }
 
-func (self *payloadAge) markAcked() {
-	atomic.AddInt32(&self.retxQueued, 1)
+// markAcked marks the payload and acked and returns true if the payload is queued for retransmission
+func (self *payloadAge) markAcked() bool {
+	return atomic.AddInt32(&self.retxQueued, 2) > 2
 }
 
 func (self *payloadAge) dequeued() {
@@ -203,6 +201,7 @@ func (buffer *LinkSendBuffer) run() {
 		case payloadAge := <-buffered:
 			buffer.buffer[payloadAge.payload.GetSequence()] = payloadAge
 			buffer.linkSendBufferSize += uint32(len(payloadAge.payload.Data))
+			atomic.AddInt64(&outstandingPayloads, 1)
 			log.Tracef("buffering payload %v with size %v. payload buffer size: %v",
 				payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.linkSendBufferSize)
 
@@ -230,12 +229,15 @@ func (buffer *LinkSendBuffer) receiveAcknowledgement(ack *Acknowledgement) {
 
 	for _, sequence := range ack.Sequence {
 		if payloadAge, found := buffer.buffer[sequence]; found {
-			payloadAge.markAcked()
+			if payloadAge.markAcked() {
+				retransmitter.queue(payloadAge, buffer.x)
+			}
 
 			payloadSize := uint32(len(payloadAge.payload.Data))
 			buffer.accumulator += payloadSize
 			buffer.successfulAcks++
 			delete(buffer.buffer, sequence)
+			atomic.AddInt64(&outstandingPayloads, -1)
 			buffer.linkSendBufferSize -= payloadSize
 			log.Debugf("removing payload %v with size %v. payload buffer size: %v",
 				payloadAge.payload.Sequence, len(payloadAge.payload.Data), buffer.linkSendBufferSize)
@@ -252,6 +254,7 @@ func (buffer *LinkSendBuffer) receiveAcknowledgement(ack *Acknowledgement) {
 			duplicateAcksMeter.Mark(1)
 			buffer.duplicateAcks++
 			if buffer.duplicateAcks >= buffer.x.Options.TxPortalDupAckThresh {
+				buffer.accumulator = 0
 				buffer.duplicateAcks = 0
 				buffer.scale(buffer.x.Options.TxPortalDupAckScale)
 			}
@@ -275,10 +278,11 @@ func (buffer *LinkSendBuffer) retransmit() {
 		for _, v := range buffer.buffer {
 			if v.isRetransmittable() && uint32(now-v.getAge()) >= buffer.retransmitAge {
 				v.markQueued()
-				retransmitter.retransmit(v, buffer.x.address)
+				retransmitter.queue(v, buffer.x)
 				retransmitted++
 				buffer.retransmits++
 				if buffer.retransmits >= buffer.x.Options.TxPortalRetxThresh {
+					buffer.accumulator = 0
 					buffer.retransmits = 0
 					buffer.scale(buffer.x.Options.TxPortalRetxScale)
 				}
@@ -300,26 +304,5 @@ func (buffer *LinkSendBuffer) scale(factor float64) {
 		}
 	} else if buffer.windowsSize < buffer.x.Options.TxPortalMinSize {
 		buffer.windowsSize = buffer.x.Options.TxPortalMinSize
-
 	}
-}
-
-type retransmit struct {
-	*payloadAge
-	session string
-	Address
-}
-
-func (r *retransmit) Compare(comparable llrb.Comparable) int {
-	if other, ok := comparable.(*retransmit); ok {
-		if result := int(r.age - other.age); result != 0 {
-			return result
-		}
-		if result := int(r.payload.Sequence - other.payload.Sequence); result != 0 {
-			return result
-		}
-		return strings.Compare(r.session, other.session)
-	}
-	pfxlog.Logger().Errorf("*retransmit was compared to %v, which should not happen", reflect.TypeOf(comparable))
-	return -1
 }

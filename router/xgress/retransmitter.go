@@ -4,6 +4,8 @@ import (
 	"github.com/biogo/store/llrb"
 	"github.com/michaelquigley/pfxlog"
 	"github.com/openziti/foundation/metrics"
+	"reflect"
+	"strings"
 	"sync/atomic"
 )
 
@@ -39,10 +41,10 @@ func NewRetransmitter(forwarder PayloadBufferForwarder, metrics metrics.Registry
 	return ctrl
 }
 
-func (retransmitter *Retransmitter) retransmit(p *payloadAge, address Address) {
+func (retransmitter *Retransmitter) queue(p *payloadAge, x *Xgress) {
 	retransmitter.retransmitIngest <- &retransmit{
 		payloadAge: p,
-		Address:    address,
+		x:          x,
 	}
 }
 
@@ -57,12 +59,12 @@ func (retransmitter *Retransmitter) retransmitIngester() {
 		if next == nil {
 			select {
 			case retransmit := <-retransmitter.retransmitIngest:
-				retransmitter.retransmits.Insert(retransmit)
+				retransmitter.acceptRetransmit(retransmit)
 			}
 		} else {
 			select {
 			case retransmit := <-retransmitter.retransmitIngest:
-				retransmitter.retransmits.Insert(retransmit)
+				retransmitter.acceptRetransmit(retransmit)
 			case retransmitter.retransmitSend <- next:
 				next = nil
 			}
@@ -71,12 +73,22 @@ func (retransmitter *Retransmitter) retransmitIngester() {
 	}
 }
 
+func (retransmitter *Retransmitter) acceptRetransmit(r *retransmit) {
+	if r.isAcked() {
+		if retransmitter.retransmits.Get(r) != nil {
+			retransmitter.retransmits.Delete(r)
+		}
+	} else {
+		retransmitter.retransmits.Insert(r)
+	}
+}
+
 func (retransmitter *Retransmitter) retransmitSender() {
 	logger := pfxlog.Logger()
 	for retransmit := range retransmitter.retransmitSend {
 		if !retransmit.isAcked() {
-			if err := retransmitter.forwarder.ForwardPayload(retransmit.Address, retransmit.payloadAge.payload); err != nil {
-				logger.WithError(err).Errorf("unexpected error while retransmitting payload from %v", retransmit.Address)
+			if err := retransmitter.forwarder.ForwardPayload(retransmit.x.address, retransmit.payloadAge.payload); err != nil {
+				logger.WithError(err).Errorf("unexpected error while retransmitting payload from %v", retransmit.x.address)
 				retransmissionFailures.Mark(1)
 			} else {
 				retransmit.markSent()
@@ -85,4 +97,23 @@ func (retransmitter *Retransmitter) retransmitSender() {
 			retransmit.dequeued()
 		}
 	}
+}
+
+type retransmit struct {
+	*payloadAge
+	x *Xgress
+}
+
+func (r *retransmit) Compare(comparable llrb.Comparable) int {
+	if other, ok := comparable.(*retransmit); ok {
+		if result := int(r.age - other.age); result != 0 {
+			return result
+		}
+		if result := int(r.payload.Sequence - other.payload.Sequence); result != 0 {
+			return result
+		}
+		return strings.Compare(r.x.sessionId, other.x.sessionId)
+	}
+	pfxlog.Logger().Errorf("*retransmit was compared to %v, which should not happen", reflect.TypeOf(comparable))
+	return -1
 }

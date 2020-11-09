@@ -5,7 +5,7 @@ go 1.15
 replace github.com/openziti/foundation => ../foundation
 
 require (
-	github.com/biogo/store v0.0.0-20190426020002-884f370e325d
+	github.com/biogo/store v0.0.0-20200525035639-8c94ae1e7c9c
 	github.com/ef-ds/deque v1.0.4
 	github.com/emirpasic/gods v1.12.0
 	github.com/golang/protobuf v1.4.3
