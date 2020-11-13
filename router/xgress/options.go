@@ -38,6 +38,7 @@ type Options struct {
 	TxPortalDupAckScale    float64
 
 	RxBufferSize uint32
+	RetxInitial  uint32
 	RetxScale    float64
 	RetxAddMs    uint32
 }
@@ -91,6 +92,9 @@ func LoadOptions(data OptionsData) *Options {
 
 		if value, found := data["rxBufferSize"]; found {
 			options.RxBufferSize = uint32(value.(int))
+		}
+		if value, found := data["retxInitial"]; found {
+			options.RetxInitial = uint32(value.(int))
 		}
 		if value, found := data["retxScale"]; found {
 			options.RetxScale = value.(float64)

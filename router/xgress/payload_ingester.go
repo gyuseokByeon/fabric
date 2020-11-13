@@ -17,14 +17,14 @@ type PayloadIngester struct {
 }
 
 func NewPayloadIngester() *PayloadIngester {
-	ctrl := &PayloadIngester{
+	pi := &PayloadIngester{
 		payloadIngest:  make(chan *payloadEntry, 16),
 		payloadSendReq: make(chan *Xgress, 16),
 	}
 
-	go ctrl.run()
+	go pi.run()
 
-	return ctrl
+	return pi
 }
 
 func (payloadIngester *PayloadIngester) ingest(payload *Payload, x *Xgress) {

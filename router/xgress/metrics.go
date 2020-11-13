@@ -27,6 +27,7 @@ var txWindowSize metrics.Histogram
 var buffersBlockedByLocalWindow int64
 var buffersBlockedByRemoteWindow int64
 var outstandingPayloads int64
+var outstandingPayloadBytes int64
 
 func InitMetrics(registry metrics.UsageRegistry) {
 	droppedPayloadsMeter = registry.Meter("xgress.dropped_payloads")
@@ -57,5 +58,9 @@ func InitMetrics(registry metrics.UsageRegistry) {
 
 	registry.FuncGauge("xgress.tx_unacked_payloads", func() int64 {
 		return atomic.LoadInt64(&outstandingPayloads)
+	})
+
+	registry.FuncGauge("xgress.tx_unacked_payload_bytes", func() int64 {
+		return atomic.LoadInt64(&outstandingPayloadBytes)
 	})
 }

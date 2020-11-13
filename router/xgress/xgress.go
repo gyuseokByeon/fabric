@@ -99,6 +99,7 @@ type Xgress struct {
 	originator     Originator
 	Options        *Options
 	txQueue        chan *Payload
+	closeNotify    chan struct{}
 	rxSequence     int32
 	rxSequenceLock sync.Mutex
 	receiveHandler ReceiveHandler
@@ -117,6 +118,7 @@ func NewXgress(sessionId *identity.TokenId, address Address, peer Connection, or
 		originator:   originator,
 		Options:      options,
 		txQueue:      make(chan *Payload, options.TxQueueSize),
+		closeNotify:  make(chan struct{}),
 		rxSequence:   0,
 		linkRxBuffer: NewLinkReceiveBuffer(),
 	}
@@ -205,7 +207,7 @@ func (self *Xgress) Close() {
 
 	if self.closed.CompareAndSwap(false, true) {
 		log.Debug("closing tx queue")
-		close(self.txQueue)
+		close(self.closeNotify)
 
 		self.payloadBuffer.Close()
 
@@ -231,14 +233,6 @@ func (self *Xgress) SendPayload(payload *Payload) error {
 	if self.closed.Get() {
 		return nil
 	}
-
-	defer func() {
-		if r := recover(); r != nil {
-			pfxlog.ContextLogger(self.Label()).WithFields(payload.GetLoggerFields()).
-				WithField("error", r).Error("send on closed channel")
-			return
-		}
-	}()
 
 	if payload.IsSessionEndFlagSet() {
 		pfxlog.ContextLogger(self.Label()).Debug("received end of session Payload")
@@ -274,15 +268,40 @@ func (self *Xgress) payloadIngester(payload *Payload) {
 }
 
 func (self *Xgress) queueSends() {
-	txPayload := self.linkRxBuffer.NextReadyPayload()
-	for txPayload != nil {
+	payload := self.linkRxBuffer.PeekHead()
+	for payload != nil {
 		select {
-		case self.txQueue <- txPayload:
-			self.linkRxBuffer.RemoveReadyPayload()
-			txPayload = self.linkRxBuffer.NextReadyPayload()
+		case self.txQueue <- payload:
+			self.linkRxBuffer.Remove(payload)
+			payload = self.linkRxBuffer.PeekHead()
 		default:
-			txPayload = nil
+			payload = nil
 		}
+	}
+}
+
+func (self *Xgress) nextPayload() *Payload {
+	select {
+	case payload := <-self.txQueue:
+		return payload
+	default:
+	}
+
+	// nothing was availabe in the txQueue, request more, then wait on txQueue
+	payloadIngester.payloadSendReq <- self
+
+	select {
+	case payload := <-self.txQueue:
+		return payload
+	case <-self.closeNotify:
+	}
+
+	// closed, check if there's anything pending in the queue
+	select {
+	case payload := <-self.txQueue:
+		return payload
+	default:
+		return nil
 	}
 }
 
@@ -295,12 +314,7 @@ func (self *Xgress) tx() {
 	var payload *Payload
 
 	for {
-		select {
-		case payload = <-self.txQueue:
-		default:
-			payloadIngester.payloadSendReq <- self
-			payload = <-self.txQueue
-		}
+		payload = self.nextPayload()
 
 		if payload == nil || payload.IsSessionEndFlagSet() {
 			return
@@ -319,7 +333,7 @@ func (self *Xgress) tx() {
 				return
 			} else {
 				payloadWriteTimer.UpdateSince(start)
-				payloadLogger.Debugf("sent (#%d) [%s]", payload.GetSequence(), info.ByteCount(int64(n)))
+				payloadLogger.Infof("sent [%s]", info.ByteCount(int64(n)))
 			}
 		}
 		payloadSize := len(payload.Data)

@@ -24,27 +24,25 @@ type Acker struct {
 	acks          *deque.Deque
 	ackIngest     chan *ackEntry
 	ackSend       chan *ackEntry
-	ackTicker     *time.Ticker
 	acksQueueSize int64
 }
 
 func NewAcker(forwarder PayloadBufferForwarder, metrics metrics.Registry) *Acker {
-	ctrl := &Acker{
+	result := &Acker{
 		forwarder: forwarder,
 		acks:      deque.New(),
 		ackIngest: make(chan *ackEntry, 16),
 		ackSend:   make(chan *ackEntry, 1),
-		ackTicker: time.NewTicker(250 * time.Millisecond),
 	}
 
-	go ctrl.ackIngester()
-	go ctrl.ackSender()
+	go result.ackIngester()
+	go result.ackSender()
 
 	metrics.FuncGauge("xgress.acks.queue_size", func() int64 {
-		return atomic.LoadInt64(&ctrl.acksQueueSize)
+		return atomic.LoadInt64(&result.acksQueueSize)
 	})
 
-	return ctrl
+	return result
 }
 
 func (acker *Acker) ack(ack *Acknowledgement, address Address) {

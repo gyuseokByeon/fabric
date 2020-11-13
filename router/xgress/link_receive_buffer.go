@@ -67,19 +67,19 @@ func (buffer *LinkReceiveBuffer) ReceiveUnordered(payload *Payload, maxSize uint
 	return true
 }
 
-func (buffer *LinkReceiveBuffer) NextReadyPayload() *Payload {
-	if buffer.tree.LeftKey() != nil {
-		if nextSequence := buffer.tree.LeftKey().(int32); nextSequence == buffer.sequence+1 {
-			return buffer.tree.LeftValue().(*Payload)
+func (buffer *LinkReceiveBuffer) PeekHead() *Payload {
+	if val := buffer.tree.LeftValue(); val != nil {
+		payload := val.(*Payload)
+		if payload.Sequence == buffer.sequence+1 {
+			return payload
 		}
 	}
 	return nil
 }
 
-func (buffer *LinkReceiveBuffer) RemoveReadyPayload() {
-	nextSequence := buffer.tree.LeftKey().(int32)
-	buffer.tree.Remove(nextSequence)
-	buffer.sequence = nextSequence
+func (buffer *LinkReceiveBuffer) Remove(payload *Payload) {
+	buffer.tree.Remove(payload.Sequence)
+	buffer.sequence = payload.Sequence
 	localRecvBufferSizeMsgsHistogram.Update(int64(buffer.tree.Size()))
 }
 
